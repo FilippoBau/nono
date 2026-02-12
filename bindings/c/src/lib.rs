@@ -90,19 +90,17 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
 
 /// Convert a Rust `String` to a caller-owned C string.
 ///
-/// Returns `null_mut` if the string cannot be represented (should not happen
-/// in practice since nono strings are valid UTF-8).
+/// Returns NULL and sets the last error if the string contains an interior
+/// NUL byte (which would cause silent truncation in C).
 pub(crate) fn rust_string_to_c(s: String) -> *mut c_char {
     match CString::new(s) {
         Ok(cstr) => cstr.into_raw(),
         Err(nul_err) => {
-            let pos = nul_err.nul_position();
-            let mut bytes = nul_err.into_vec();
-            bytes.truncate(pos);
-            match CString::new(bytes) {
-                Ok(cstr) => cstr.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+            set_last_error(&format!(
+                "string contains interior NUL byte at position {}",
+                nul_err.nul_position()
+            ));
+            std::ptr::null_mut()
         }
     }
 }
@@ -273,5 +271,25 @@ mod tests {
         assert_eq!(recovered, "hello nono");
         // SAFETY: c_ptr was created by rust_string_to_c.
         unsafe { nono_string_free(c_ptr) };
+    }
+
+    #[test]
+    fn test_rust_string_to_c_rejects_interior_nul() {
+        nono_clear_error();
+        let with_nul = "hello\0world".to_string();
+        let c_ptr = rust_string_to_c(with_nul);
+        assert!(c_ptr.is_null());
+
+        let err = nono_last_error();
+        assert!(!err.is_null());
+        // SAFETY: err was just returned by nono_last_error().
+        let msg = unsafe { CStr::from_ptr(err) }.to_str().unwrap_or_default();
+        assert!(
+            msg.contains("interior NUL"),
+            "error should mention interior NUL: {msg}"
+        );
+        // SAFETY: err was returned by nono_last_error().
+        unsafe { nono_string_free(err) };
+        nono_clear_error();
     }
 }

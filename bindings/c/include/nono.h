@@ -283,11 +283,14 @@ enum NonoErrorCode nono_capability_set_allow_file(struct NonoCapabilitySet *caps
 /**
  * Set whether outbound network access is blocked.
  *
+ * Returns `Ok` on success, or `ErrInvalidArg` if `caps` is NULL.
+ *
  * # Safety
  *
  * `caps` must be a valid pointer from `nono_capability_set_new()`.
  */
-void nono_capability_set_set_network_blocked(struct NonoCapabilitySet *caps, bool blocked);
+enum NonoErrorCode nono_capability_set_set_network_blocked(struct NonoCapabilitySet *caps,
+                                                           bool blocked);
 
 /**
  * Add a command to the allow list (overrides block lists).

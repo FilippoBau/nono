@@ -146,6 +146,8 @@ pub unsafe extern "C" fn nono_capability_set_allow_file(
 
 /// Set whether outbound network access is blocked.
 ///
+/// Returns `Ok` on success, or `ErrInvalidArg` if `caps` is NULL.
+///
 /// # Safety
 ///
 /// `caps` must be a valid pointer from `nono_capability_set_new()`.
@@ -153,12 +155,14 @@ pub unsafe extern "C" fn nono_capability_set_allow_file(
 pub unsafe extern "C" fn nono_capability_set_set_network_blocked(
     caps: *mut NonoCapabilitySet,
     blocked: bool,
-) {
+) -> NonoErrorCode {
     if caps.is_null() {
-        return;
+        set_last_error("caps pointer is NULL");
+        return NonoErrorCode::ErrInvalidArg;
     }
     let caps = unsafe { &mut *caps };
     caps.inner.set_network_blocked(blocked);
+    NonoErrorCode::Ok
 }
 
 /// Add a command to the allow list (overrides block lists).
@@ -360,11 +364,26 @@ mod tests {
         // SAFETY: caps is valid.
         unsafe {
             assert!(!nono_capability_set_is_network_blocked(caps));
-            nono_capability_set_set_network_blocked(caps, true);
+            assert_eq!(
+                nono_capability_set_set_network_blocked(caps, true),
+                NonoErrorCode::Ok,
+            );
             assert!(nono_capability_set_is_network_blocked(caps));
-            nono_capability_set_set_network_blocked(caps, false);
+            assert_eq!(
+                nono_capability_set_set_network_blocked(caps, false),
+                NonoErrorCode::Ok,
+            );
             assert!(!nono_capability_set_is_network_blocked(caps));
             nono_capability_set_free(caps);
+        }
+    }
+
+    #[test]
+    fn test_set_network_blocked_null() {
+        // SAFETY: deliberately passing NULL.
+        unsafe {
+            let rc = nono_capability_set_set_network_blocked(std::ptr::null_mut(), true);
+            assert_eq!(rc, NonoErrorCode::ErrInvalidArg);
         }
     }
 
