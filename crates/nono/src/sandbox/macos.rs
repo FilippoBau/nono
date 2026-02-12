@@ -97,7 +97,7 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
             cap.resolved.display()
         ))
     })?;
-    let escaped_resolved = escape_path(resolved_str);
+    let escaped_resolved = escape_path(resolved_str)?;
     let kind = if cap.is_file { "literal" } else { "subpath" };
     filters.push(format!("{} \"{}\"", kind, escaped_resolved));
 
@@ -105,7 +105,7 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
     // for the original too so Seatbelt allows traversing the symlink.
     if cap.original != cap.resolved {
         if let Some(original_str) = cap.original.to_str() {
-            let escaped_original = escape_path(original_str);
+            let escaped_original = escape_path(original_str)?;
             filters.push(format!("{} \"{}\"", kind, escaped_original));
         }
     }
@@ -116,20 +116,25 @@ fn path_filters_for_cap(cap: &crate::capability::FsCapability) -> Result<Vec<Str
 /// Escape a path for use in Seatbelt profile strings.
 ///
 /// Paths are placed inside double-quoted S-expression strings where `\` and `"`
-/// are the significant characters. All control characters (0x00-0x1F, 0x7F, and
-/// Unicode control chars) are stripped since they cannot appear in valid filesystem
-/// paths and could disrupt Seatbelt's S-expression parser.
-fn escape_path(path: &str) -> String {
+/// are the significant characters. Control characters (0x00-0x1F, 0x7F) are
+/// rejected because silently stripping them would cause the sandbox rule to
+/// target a different path than intended.
+fn escape_path(path: &str) -> Result<String> {
     let mut result = String::with_capacity(path.len());
     for c in path.chars() {
         match c {
             '\\' => result.push_str("\\\\"),
             '"' => result.push_str("\\\""),
-            c if c.is_control() => {}
+            c if c.is_control() => {
+                return Err(NonoError::SandboxInit(format!(
+                    "path contains control character 0x{:02X}: {}",
+                    c as u32, path
+                )));
+            }
             _ => result.push(c),
         }
     }
-    result
+    Ok(result)
 }
 
 /// Generate a Seatbelt profile from capabilities
@@ -181,7 +186,7 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
     // Allow metadata access to parent directories of granted paths (for path resolution)
     let parent_dirs = collect_parent_dirs(caps);
     for parent in &parent_dirs {
-        let escaped = escape_path(parent);
+        let escaped = escape_path(parent)?;
         profile.push_str(&format!(
             "(allow file-read-metadata (literal \"{}\"))\n",
             escaped
@@ -417,17 +422,23 @@ mod tests {
 
     #[test]
     fn test_escape_path() {
-        assert_eq!(escape_path("/simple/path"), "/simple/path");
-        assert_eq!(escape_path("/path with\\slash"), "/path with\\\\slash");
-        assert_eq!(escape_path("/path\"quoted"), "/path\\\"quoted");
-        assert_eq!(escape_path("/path\nwith\nnewlines"), "/pathwithnewlines");
-        assert_eq!(escape_path("/path\rwith\rreturns"), "/pathwithreturns");
-        assert_eq!(escape_path("/path\0with\0nulls"), "/pathwithnulls");
-        // All control characters must be stripped
-        assert_eq!(escape_path("/path\twith\ttabs"), "/pathwithtabs");
-        assert_eq!(escape_path("/path\x0bwith\x0cfeeds"), "/pathwithfeeds");
-        assert_eq!(escape_path("/path\x1bwith\x1bescape"), "/pathwithescape");
-        assert_eq!(escape_path("/path\x7fwith\x7fdel"), "/pathwithdel");
+        assert_eq!(escape_path("/simple/path").unwrap(), "/simple/path");
+        assert_eq!(
+            escape_path("/path with\\slash").unwrap(),
+            "/path with\\\\slash"
+        );
+        assert_eq!(escape_path("/path\"quoted").unwrap(), "/path\\\"quoted");
+    }
+
+    #[test]
+    fn test_escape_path_rejects_control_characters() {
+        assert!(escape_path("/path\0with\0nulls").is_err());
+        assert!(escape_path("/path\nwith\nnewlines").is_err());
+        assert!(escape_path("/path\rwith\rreturns").is_err());
+        assert!(escape_path("/path\twith\ttabs").is_err());
+        assert!(escape_path("/path\x0bwith\x0cfeeds").is_err());
+        assert!(escape_path("/path\x1bwith\x1bescape").is_err());
+        assert!(escape_path("/path\x7fwith\x7fdel").is_err());
     }
 
     #[test]
@@ -502,24 +513,18 @@ mod tests {
     #[test]
     fn test_escape_path_injection_via_newline() {
         // An attacker embeds a newline to break out of the quoted string and inject
-        // a new S-expression: "/tmp/evil\n(allow file-read* (subpath \"/\"))"
-        // Without newline stripping, this would become a standalone rule line.
+        // a new S-expression. This must be rejected, not silently altered.
         let malicious = "/tmp/evil\n(allow file-read* (subpath \"/\"))";
-        let escaped = escape_path(malicious);
-        assert!(
-            !escaped.contains('\n'),
-            "escaped path must not contain newlines"
-        );
-        // With newlines stripped, the S-expression text stays inside the quoted string
-        // where parentheses are harmless literal characters.
+        assert!(escape_path(malicious).is_err());
     }
 
     #[test]
     fn test_escape_path_injection_via_quote() {
         // An attacker embeds a double-quote to terminate the string early and inject
         // a new rule: /tmp/evil")(allow file-read* (subpath "/"))("
+        // Quotes are escaped (not control chars), so this must succeed with escaping.
         let malicious = "/tmp/evil\")(allow file-read* (subpath \"/\"))(\"";
-        let escaped = escape_path(malicious);
+        let escaped = escape_path(malicious).unwrap();
         // Every " in the escaped output must be preceded by \ so Seatbelt
         // treats it as a literal quote inside the string, not a terminator.
         let chars: Vec<char> = escaped.chars().collect();
@@ -535,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_profile_malicious_path_no_injection() {
+    fn test_generate_profile_rejects_malicious_path() {
         let mut caps = CapabilitySet::new();
         // A path with embedded newline + Seatbelt injection attempt
         caps.add_fs(FsCapability {
@@ -546,19 +551,10 @@ mod tests {
             source: CapabilitySource::User,
         });
 
-        let profile = generate_profile(&caps).unwrap();
-
-        // The profile must NOT contain the injected rule as a standalone line
-        for line in profile.lines() {
-            if line.contains("(allow file-read*") {
-                // Legitimate read rules contain subpath or literal for the path
-                assert!(
-                    !line.contains("(subpath \"/\")"),
-                    "injected root-read rule must not appear: {}",
-                    line
-                );
-            }
-        }
+        assert!(
+            generate_profile(&caps).is_err(),
+            "paths with control characters must be rejected"
+        );
     }
 
     #[test]
