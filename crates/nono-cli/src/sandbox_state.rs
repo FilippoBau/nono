@@ -4,7 +4,7 @@
 //! and passes the path via NONO_CAP_FILE. This allows sandboxed processes
 //! to query their own capabilities using `nono why --self`.
 
-use nono::{AccessMode, CapabilitySet, CapabilitySource, FsCapability, NonoError, Result};
+use nono::{AccessMode, CapabilitySet, FsCapability, NonoError, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -66,9 +66,12 @@ impl SandboxState {
 
     /// Convert back to a CapabilitySet
     ///
-    /// Note: This creates a "reconstructed" capability set that may not
-    /// have all the validation of the original (paths may not exist anymore).
-    pub fn to_caps(&self) -> CapabilitySet {
+    /// Paths are re-validated through the standard constructors which
+    /// canonicalize paths and verify existence. This prevents crafted
+    /// state files from injecting arbitrary paths that bypass validation.
+    ///
+    /// Returns an error if any path no longer exists or fails validation.
+    pub fn to_caps(&self) -> Result<CapabilitySet> {
         let mut caps = CapabilitySet::new();
 
         for fs_cap in &self.fs {
@@ -76,16 +79,17 @@ impl SandboxState {
                 "read" => AccessMode::Read,
                 "write" => AccessMode::Write,
                 "readwrite" => AccessMode::ReadWrite,
-                _ => AccessMode::Read, // Default to read for unknown
+                other => {
+                    return Err(NonoError::ConfigParse(format!(
+                        "invalid access mode in sandbox state: {other}"
+                    )));
+                }
             };
 
-            // Create capability without validation (path may not exist in sandbox)
-            let cap = FsCapability {
-                original: PathBuf::from(&fs_cap.original),
-                resolved: PathBuf::from(&fs_cap.path),
-                access,
-                is_file: fs_cap.is_file,
-                source: CapabilitySource::default(),
+            let cap = if fs_cap.is_file {
+                FsCapability::new_file(&fs_cap.original, access)?
+            } else {
+                FsCapability::new_dir(&fs_cap.original, access)?
             };
             caps.add_fs(cap);
         }
@@ -98,7 +102,7 @@ impl SandboxState {
             caps.add_blocked_command(cmd.clone());
         }
 
-        caps
+        Ok(caps)
     }
 
     /// Write sandbox state to a file with secure permissions
@@ -346,7 +350,9 @@ mod tests {
         assert!(state.net_blocked);
         assert_eq!(state.allowed_commands, vec!["pip"]);
 
-        let restored = state.to_caps();
+        let restored = state
+            .to_caps()
+            .expect("to_caps failed on network-only state");
         assert!(restored.is_network_blocked());
         assert_eq!(restored.allowed_commands(), vec!["pip"]);
     }

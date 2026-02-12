@@ -121,7 +121,7 @@ fn run_why(args: WhyArgs) -> Result<()> {
     let caps = if args.self_query {
         // Inside sandbox - load from state file
         match load_sandbox_state() {
-            Some(state) => state.to_caps(),
+            Some(state) => state.to_caps()?,
             None => {
                 let result = QueryResult::NotSandboxed {
                     message: "Not running inside a nono sandbox".to_string(),

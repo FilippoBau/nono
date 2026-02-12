@@ -2,7 +2,7 @@
 //!
 //! This module provides serialization of capability state for diagnostic purposes.
 
-use crate::capability::{AccessMode, CapabilitySet, CapabilitySource, FsCapability};
+use crate::capability::{AccessMode, CapabilitySet, FsCapability};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -49,7 +49,11 @@ impl SandboxState {
 
     /// Convert state back to a capability set
     ///
-    /// Note: This may fail if paths no longer exist
+    /// Paths are re-validated through the standard constructors (`new_dir`/`new_file`)
+    /// which canonicalize paths and verify existence. This prevents crafted JSON from
+    /// injecting arbitrary paths that bypass validation.
+    ///
+    /// Returns an error if any path no longer exists or fails validation.
     pub fn to_caps(&self) -> crate::error::Result<CapabilitySet> {
         let mut caps = CapabilitySet::new();
 
@@ -58,16 +62,19 @@ impl SandboxState {
                 "read" => AccessMode::Read,
                 "write" => AccessMode::Write,
                 "read+write" => AccessMode::ReadWrite,
-                _ => AccessMode::Read, // Default fallback
+                other => {
+                    return Err(crate::error::NonoError::ConfigParse(format!(
+                        "invalid access mode in sandbox state: {other}"
+                    )));
+                }
             };
 
-            // Use the resolved path directly since it was already validated
-            let cap = FsCapability {
-                original: fs_cap.original.clone(),
-                resolved: fs_cap.resolved.clone(),
-                access,
-                is_file: fs_cap.is_file,
-                source: CapabilitySource::default(),
+            // Re-validate through the standard constructors to ensure
+            // path canonicalization and existence checks are applied.
+            let cap = if fs_cap.is_file {
+                FsCapability::new_file(&fs_cap.original, access)?
+            } else {
+                FsCapability::new_dir(&fs_cap.original, access)?
             };
             caps.add_fs(cap);
         }
@@ -103,5 +110,41 @@ mod tests {
         let json = state.to_json();
         let restored = SandboxState::from_json(&json).unwrap();
         assert!(restored.net_blocked);
+    }
+
+    #[test]
+    fn test_to_caps_rejects_nonexistent_path() {
+        let json = r#"{
+            "fs": [{
+                "original": "/nonexistent/crafted/path",
+                "resolved": "/nonexistent/crafted/path",
+                "access": "read+write",
+                "is_file": false
+            }],
+            "net_blocked": false
+        }"#;
+        let state = SandboxState::from_json(json).unwrap();
+        assert!(
+            state.to_caps().is_err(),
+            "to_caps must reject nonexistent paths"
+        );
+    }
+
+    #[test]
+    fn test_to_caps_rejects_invalid_access_mode() {
+        let json = r#"{
+            "fs": [{
+                "original": "/tmp",
+                "resolved": "/tmp",
+                "access": "root-access",
+                "is_file": false
+            }],
+            "net_blocked": false
+        }"#;
+        let state = SandboxState::from_json(json).unwrap();
+        assert!(
+            state.to_caps().is_err(),
+            "to_caps must reject invalid access modes"
+        );
     }
 }
