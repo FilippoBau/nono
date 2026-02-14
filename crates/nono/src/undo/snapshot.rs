@@ -128,6 +128,53 @@ impl SnapshotManager {
         Ok((manifest, changes))
     }
 
+    /// Compute what `restore_to` would change without actually restoring.
+    ///
+    /// Compares the current filesystem state against the manifest and returns
+    /// the list of changes that would be applied. Useful for dry-run previews.
+    pub fn compute_restore_diff(&self, manifest: &SnapshotManifest) -> Result<Vec<Change>> {
+        let current_files = self.walk_current()?;
+        let mut changes = Vec::new();
+
+        for (path, state) in &manifest.files {
+            let needs_restore = match current_files.get(path) {
+                Some(current) => current.hash != state.hash,
+                None => true,
+            };
+
+            if needs_restore {
+                let change_type = if current_files.contains_key(path) {
+                    ChangeType::Modified
+                } else {
+                    ChangeType::Created
+                };
+
+                changes.push(Change {
+                    path: path.clone(),
+                    change_type,
+                    size_delta: None,
+                    old_hash: current_files.get(path).map(|s| s.hash),
+                    new_hash: Some(state.hash),
+                });
+            }
+        }
+
+        for (path, state) in &current_files {
+            if !manifest.files.contains_key(path) {
+                changes.push(Change {
+                    path: path.clone(),
+                    change_type: ChangeType::Deleted,
+                    size_delta: None,
+                    old_hash: Some(state.hash),
+                    new_hash: None,
+                });
+            }
+        }
+
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(changes)
+    }
+
     /// Restore filesystem to the state captured by the given manifest.
     ///
     /// For each file in the manifest: restores content from object store
@@ -288,6 +335,59 @@ impl SnapshotManager {
     #[must_use]
     pub fn snapshot_count(&self) -> u32 {
         self.snapshot_count
+    }
+
+    /// Load session metadata from a session directory.
+    ///
+    /// Does not require tracked paths or exclusion filter — reads `session.json`
+    /// directly. Useful for session discovery and browsing.
+    pub fn load_session_metadata(session_dir: &Path) -> Result<SessionMetadata> {
+        let path = session_dir.join("session.json");
+        let content = fs::read_to_string(&path).map_err(|e| {
+            NonoError::SessionNotFound(format!(
+                "Failed to read session metadata {}: {e}",
+                path.display()
+            ))
+        })?;
+        serde_json::from_str(&content).map_err(|e| {
+            NonoError::Snapshot(format!(
+                "Failed to parse session metadata {}: {e}",
+                path.display()
+            ))
+        })
+    }
+
+    /// Load a snapshot manifest from a session directory by number.
+    ///
+    /// Does not require a full `SnapshotManager` — reads directly from disk.
+    pub fn load_manifest_from(session_dir: &Path, number: u32) -> Result<SnapshotManifest> {
+        let path = session_dir
+            .join("snapshots")
+            .join(format!("{number:03}.json"));
+        let content = fs::read_to_string(&path).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to read manifest {}: {e}", path.display()))
+        })?;
+        serde_json::from_str(&content).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to parse manifest {}: {e}", path.display()))
+        })
+    }
+
+    /// Load a change record from a session directory by snapshot number.
+    ///
+    /// Returns `Ok(vec![])` if the change file doesn't exist (baseline or no changes).
+    pub fn load_changes_from(session_dir: &Path, number: u32) -> Result<Vec<Change>> {
+        let path = session_dir
+            .join("changes")
+            .join(format!("{number:03}.json"));
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&path).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to read changes {}: {e}", path.display()))
+        })?;
+        serde_json::from_str(&content).map_err(|e| {
+            NonoError::Snapshot(format!("Failed to parse changes {}: {e}", path.display()))
+        })
     }
 
     /// Walk tracked paths and store all non-excluded files in the object store.
@@ -787,6 +887,85 @@ mod tests {
         let loaded: SessionMetadata = serde_json::from_str(&content).expect("parse session.json");
         assert_eq!(loaded.session_id, "test-session");
         assert_eq!(loaded.merkle_roots.len(), 1);
+    }
+
+    #[test]
+    fn compute_restore_diff_shows_changes_without_modifying_disk() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        // Make changes
+        fs::write(tracked.join("file1.txt"), b"modified").expect("modify");
+        fs::write(tracked.join("new.txt"), b"new file").expect("create");
+        fs::remove_file(tracked.join("file2.txt")).expect("delete");
+
+        // Compute diff without restoring
+        let diff = manager.compute_restore_diff(&baseline).expect("diff");
+        assert!(!diff.is_empty());
+
+        // Files should NOT be restored — disk state unchanged
+        let content = fs::read_to_string(tracked.join("file1.txt")).expect("read");
+        assert_eq!(content, "modified");
+        assert!(tracked.join("new.txt").exists());
+        assert!(!tracked.join("file2.txt").exists());
+    }
+
+    #[test]
+    fn load_session_metadata_static() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        let meta = SessionMetadata {
+            session_id: "static-load-test".to_string(),
+            started: "2025-01-01T00:00:00Z".to_string(),
+            ended: None,
+            command: vec!["test".to_string()],
+            tracked_paths: vec![tracked.to_path_buf()],
+            snapshot_count: 1,
+            exit_code: None,
+            merkle_roots: vec![baseline.merkle_root],
+            signature: None,
+            signing_key_id: None,
+        };
+        manager.save_session_metadata(&meta).expect("save");
+
+        // Load without a SnapshotManager
+        let loaded = SnapshotManager::load_session_metadata(&session_dir).expect("load");
+        assert_eq!(loaded.session_id, "static-load-test");
+    }
+
+    #[test]
+    fn load_manifest_and_changes_static() {
+        let (dir, tracked) = setup_test_dir();
+        let session_dir = dir.path().join("session");
+        fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let mut manager = make_manager(&session_dir, &tracked);
+        let baseline = manager.create_baseline().expect("baseline");
+
+        // Modify and create incremental
+        fs::write(tracked.join("file1.txt"), b"modified").expect("modify");
+        let (_incr, _changes) = manager.create_incremental(&baseline).expect("incremental");
+
+        // Load via static methods
+        let manifest = SnapshotManager::load_manifest_from(&session_dir, 0).expect("load manifest");
+        assert_eq!(manifest.number, 0);
+
+        let changes = SnapshotManager::load_changes_from(&session_dir, 1).expect("load changes");
+        assert!(!changes.is_empty());
+
+        // Baseline has no change file
+        let baseline_changes =
+            SnapshotManager::load_changes_from(&session_dir, 0).expect("load baseline changes");
+        assert!(baseline_changes.is_empty());
     }
 
     #[test]

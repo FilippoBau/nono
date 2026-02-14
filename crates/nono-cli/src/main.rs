@@ -14,6 +14,8 @@ mod profile;
 mod query_ext;
 mod sandbox_state;
 mod setup;
+mod undo_commands;
+mod undo_session;
 mod undo_ui;
 
 use capability_ext::CapabilitySetExt;
@@ -65,6 +67,7 @@ fn run() -> Result<()> {
         }
         Commands::Why(args) => run_why(*args),
         Commands::Setup(args) => run_setup(args),
+        Commands::Undo(args) => undo_commands::run_undo(args),
     }
 }
 
@@ -486,6 +489,9 @@ fn execute_sandboxed(
                 .map(|c| c.resolved.clone())
                 .collect();
 
+            // Enforce storage limits before creating a new session
+            enforce_undo_limits(flags.silent);
+
             // Set up snapshot manager if we have writable paths to track
             let undo_state = if !tracked_paths.is_empty() {
                 let session_id = format!(
@@ -821,6 +827,94 @@ fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<PreparedSandbox> 
         undo_exclude_patterns: profile_undo_patterns,
         undo_exclude_globs: profile_undo_globs,
     })
+}
+
+/// Enforce undo storage limits before creating a new session.
+///
+/// Loads user config (or defaults) and prunes oldest completed sessions
+/// until session count and total storage are under the configured limits.
+/// Errors are logged but non-fatal — failing to prune should not block
+/// the sandbox from running.
+fn enforce_undo_limits(silent: bool) {
+    let config = match config::user::load_user_config() {
+        Ok(Some(c)) => c,
+        Ok(None) => config::user::UserConfig::default(),
+        Err(e) => {
+            tracing::warn!("Failed to load user config for undo limits: {e}");
+            return;
+        }
+    };
+
+    let sessions = match undo_session::discover_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Failed to discover sessions for limit enforcement: {e}");
+            return;
+        }
+    };
+
+    if sessions.is_empty() {
+        return;
+    }
+
+    let max_sessions = config.undo.max_sessions;
+    let max_storage_bytes = (config.undo.max_storage_gb * 1024.0 * 1024.0 * 1024.0) as u64;
+
+    // Sessions are sorted newest-first. Only prune completed (non-alive) sessions.
+    let completed: Vec<&undo_session::SessionInfo> =
+        sessions.iter().filter(|s| !s.is_alive).collect();
+
+    let mut pruned = 0usize;
+    let mut pruned_bytes = 0u64;
+
+    // Prune excess sessions beyond keep limit
+    if completed.len() > max_sessions {
+        for s in &completed[max_sessions..] {
+            if let Err(e) = undo_session::remove_session(&s.dir) {
+                tracing::warn!("Failed to prune session {}: {e}", s.metadata.session_id);
+            } else {
+                pruned = pruned.saturating_add(1);
+                pruned_bytes = pruned_bytes.saturating_add(s.disk_size);
+            }
+        }
+    }
+
+    // Prune by storage limit if still over
+    let total = match undo_session::total_storage_bytes() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    if total > max_storage_bytes {
+        // Re-discover after count-based pruning
+        let remaining = match undo_session::discover_sessions() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Prune oldest completed sessions until under limit
+        let mut current_total = total;
+        for s in remaining.iter().rev().filter(|s| !s.is_alive) {
+            if current_total <= max_storage_bytes {
+                break;
+            }
+            if let Err(e) = undo_session::remove_session(&s.dir) {
+                tracing::warn!("Failed to prune session {}: {e}", s.metadata.session_id);
+            } else {
+                current_total = current_total.saturating_sub(s.disk_size);
+                pruned = pruned.saturating_add(1);
+                pruned_bytes = pruned_bytes.saturating_add(s.disk_size);
+            }
+        }
+    }
+
+    if pruned > 0 && !silent {
+        eprintln!(
+            "  Auto-pruned {} old session(s) (freed {})",
+            pruned,
+            undo_session::format_bytes(pruned_bytes),
+        );
+    }
 }
 
 fn write_capability_state_file(caps: &CapabilitySet, silent: bool) -> Option<std::path::PathBuf> {

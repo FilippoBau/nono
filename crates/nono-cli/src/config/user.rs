@@ -24,6 +24,8 @@ pub struct UserConfig {
     pub extensions: UserExtensions,
     #[serde(default)]
     pub trusted_keys: HashMap<String, TrustedKeyInfo>,
+    #[serde(default)]
+    pub undo: UndoSettings,
 }
 
 /// Metadata for user config
@@ -88,6 +90,47 @@ pub struct TrustedKeyInfo {
     /// Key fingerprint for verification
     #[serde(default)]
     pub fingerprint: Option<String>,
+}
+
+/// Undo system settings
+#[derive(Debug, Clone, Deserialize)]
+pub struct UndoSettings {
+    /// Maximum number of sessions to retain
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
+    /// Maximum total storage in gigabytes
+    #[serde(default = "default_max_storage_gb")]
+    pub max_storage_gb: f64,
+    /// Maximum snapshots per session
+    #[serde(default = "default_max_snapshots")]
+    pub max_snapshots: u32,
+    /// Hours to keep stale sessions (ended is None, PID dead) before cleanup
+    #[serde(default = "default_stale_grace_hours")]
+    pub stale_grace_hours: u64,
+}
+
+fn default_max_sessions() -> usize {
+    10
+}
+fn default_max_storage_gb() -> f64 {
+    5.0
+}
+fn default_max_snapshots() -> u32 {
+    100
+}
+fn default_stale_grace_hours() -> u64 {
+    24
+}
+
+impl Default for UndoSettings {
+    fn default() -> Self {
+        Self {
+            max_sessions: default_max_sessions(),
+            max_storage_gb: default_max_storage_gb(),
+            max_snapshots: default_max_snapshots(),
+            stale_grace_hours: default_stale_grace_hours(),
+        }
+    }
 }
 
 /// Load user configuration from ~/.config/nono/config.toml
@@ -195,5 +238,31 @@ alice = { name = "Alice", fingerprint = "abc123" }
 
         assert!(config.overrides.sensitive_paths.is_empty());
         assert!(config.overrides.commands.is_empty());
+    }
+
+    #[test]
+    fn test_undo_settings_defaults() {
+        let toml = "";
+        let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
+        assert_eq!(config.undo.max_sessions, 10);
+        assert!((config.undo.max_storage_gb - 5.0).abs() < f64::EPSILON);
+        assert_eq!(config.undo.max_snapshots, 100);
+        assert_eq!(config.undo.stale_grace_hours, 24);
+    }
+
+    #[test]
+    fn test_undo_settings_custom() {
+        let toml = r#"
+[undo]
+max_sessions = 20
+max_storage_gb = 10.0
+max_snapshots = 50
+stale_grace_hours = 48
+"#;
+        let config: UserConfig = toml::from_str(toml).expect("Failed to parse");
+        assert_eq!(config.undo.max_sessions, 20);
+        assert!((config.undo.max_storage_gb - 10.0).abs() < f64::EPSILON);
+        assert_eq!(config.undo.max_snapshots, 50);
+        assert_eq!(config.undo.stale_grace_hours, 48);
     }
 }

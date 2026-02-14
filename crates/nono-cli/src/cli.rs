@@ -123,6 +123,31 @@ pub enum Commands {
     nono setup -v --profiles
 ")]
     Setup(SetupArgs),
+
+    /// Manage undo sessions (browse, restore, audit, cleanup)
+    #[command(after_help = "EXAMPLES:
+    # List all undo sessions
+    nono undo list
+
+    # Show details of a specific session
+    nono undo show 20260214-143022-12345
+
+    # Restore files from a session's baseline snapshot
+    nono undo restore 20260214-143022-12345
+
+    # Dry-run restore to see what would change
+    nono undo restore 20260214-143022-12345 --dry-run
+
+    # Export audit trail as JSON
+    nono undo audit 20260214-143022-12345 --json
+
+    # Verify session integrity
+    nono undo verify 20260214-143022-12345
+
+    # Clean up stale sessions (dry-run first)
+    nono undo cleanup --dry-run
+")]
+    Undo(UndoArgs),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -384,6 +409,98 @@ pub enum WhyOp {
     ReadWrite,
 }
 
+#[derive(Parser, Debug)]
+pub struct UndoArgs {
+    #[command(subcommand)]
+    pub command: UndoCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum UndoCommands {
+    /// List past undo sessions
+    List(UndoListArgs),
+    /// Show details of a specific session
+    Show(UndoShowArgs),
+    /// Restore files from a past session
+    Restore(UndoRestoreArgs),
+    /// Export session audit trail
+    Audit(UndoAuditArgs),
+    /// Verify session integrity
+    Verify(UndoVerifyArgs),
+    /// Clean up old sessions
+    Cleanup(UndoCleanupArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct UndoListArgs {
+    /// Show only the N most recent sessions
+    #[arg(long, value_name = "N")]
+    pub recent: Option<usize>,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct UndoShowArgs {
+    /// Session ID (e.g., 20260214-143022-12345)
+    pub session_id: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct UndoRestoreArgs {
+    /// Session ID (e.g., 20260214-143022-12345)
+    pub session_id: String,
+
+    /// Snapshot number to restore to (default: 0 = baseline)
+    #[arg(long, default_value = "0")]
+    pub snapshot: u32,
+
+    /// Show what would change without modifying files
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct UndoAuditArgs {
+    /// Session ID (e.g., 20260214-143022-12345)
+    pub session_id: String,
+
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct UndoVerifyArgs {
+    /// Session ID (e.g., 20260214-143022-12345)
+    pub session_id: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct UndoCleanupArgs {
+    /// Retain N newest sessions (default: from config, usually 10)
+    #[arg(long, value_name = "N")]
+    pub keep: Option<usize>,
+
+    /// Remove sessions older than N days
+    #[arg(long, value_name = "DAYS")]
+    pub older_than: Option<u64>,
+
+    /// Show what would be removed without deleting
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Remove all sessions (requires confirmation)
+    #[arg(long)]
+    pub all: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +592,162 @@ mod tests {
                 assert!(args.shell.is_none());
             }
             _ => panic!("Expected Shell command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_list() {
+        let cli = Cli::parse_from(["nono", "undo", "list"]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::List(list_args) => {
+                    assert!(list_args.recent.is_none());
+                    assert!(!list_args.json);
+                }
+                _ => panic!("Expected List subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_list_recent_json() {
+        let cli = Cli::parse_from(["nono", "undo", "list", "--recent", "5", "--json"]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::List(list_args) => {
+                    assert_eq!(list_args.recent, Some(5));
+                    assert!(list_args.json);
+                }
+                _ => panic!("Expected List subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_show() {
+        let cli = Cli::parse_from(["nono", "undo", "show", "20260214-143022-12345"]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::Show(show_args) => {
+                    assert_eq!(show_args.session_id, "20260214-143022-12345");
+                    assert!(!show_args.json);
+                }
+                _ => panic!("Expected Show subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_restore_defaults() {
+        let cli = Cli::parse_from(["nono", "undo", "restore", "20260214-143022-12345"]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::Restore(restore_args) => {
+                    assert_eq!(restore_args.session_id, "20260214-143022-12345");
+                    assert_eq!(restore_args.snapshot, 0);
+                    assert!(!restore_args.dry_run);
+                }
+                _ => panic!("Expected Restore subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_restore_with_options() {
+        let cli = Cli::parse_from([
+            "nono",
+            "undo",
+            "restore",
+            "20260214-143022-12345",
+            "--snapshot",
+            "3",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::Restore(restore_args) => {
+                    assert_eq!(restore_args.snapshot, 3);
+                    assert!(restore_args.dry_run);
+                }
+                _ => panic!("Expected Restore subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_audit() {
+        let cli = Cli::parse_from(["nono", "undo", "audit", "20260214-143022-12345", "--json"]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::Audit(audit_args) => {
+                    assert_eq!(audit_args.session_id, "20260214-143022-12345");
+                    assert!(audit_args.json);
+                }
+                _ => panic!("Expected Audit subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_verify() {
+        let cli = Cli::parse_from(["nono", "undo", "verify", "20260214-143022-12345"]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::Verify(verify_args) => {
+                    assert_eq!(verify_args.session_id, "20260214-143022-12345");
+                }
+                _ => panic!("Expected Verify subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_cleanup_defaults() {
+        let cli = Cli::parse_from(["nono", "undo", "cleanup"]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::Cleanup(cleanup_args) => {
+                    assert!(cleanup_args.keep.is_none());
+                    assert!(cleanup_args.older_than.is_none());
+                    assert!(!cleanup_args.dry_run);
+                    assert!(!cleanup_args.all);
+                }
+                _ => panic!("Expected Cleanup subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
+        }
+    }
+
+    #[test]
+    fn test_undo_cleanup_with_options() {
+        let cli = Cli::parse_from([
+            "nono",
+            "undo",
+            "cleanup",
+            "--keep",
+            "5",
+            "--older-than",
+            "30",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Commands::Undo(args) => match args.command {
+                UndoCommands::Cleanup(cleanup_args) => {
+                    assert_eq!(cleanup_args.keep, Some(5));
+                    assert_eq!(cleanup_args.older_than, Some(30));
+                    assert!(cleanup_args.dry_run);
+                    assert!(!cleanup_args.all);
+                }
+                _ => panic!("Expected Cleanup subcommand"),
+            },
+            _ => panic!("Expected Undo command"),
         }
     }
 }
