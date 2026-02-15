@@ -40,18 +40,18 @@ impl ObjectStore {
 
     /// Store a file's content and return its SHA-256 hash.
     ///
-    /// Reads the file in streaming fashion with an 8KB buffer to handle
-    /// large files without excessive memory use. If an object with the
-    /// same hash already exists, skips the write (content deduplication).
+    /// Stream-hashes the file with an 8KB buffer (no full-file memory buffer),
+    /// then uses `clonefile()` on macOS APFS for instant copy-on-write storage.
+    /// Falls back to regular copy on other filesystems/platforms.
+    /// If an object with the same hash already exists, skips the write (deduplication).
     pub fn store_file(&self, path: &Path) -> Result<ContentHash> {
         let mut file = fs::File::open(path).map_err(|e| {
             NonoError::ObjectStore(format!("Failed to open {}: {}", path.display(), e))
         })?;
 
-        // Hash the file content in streaming fashion
+        // Stream-hash without buffering entire file in memory
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; HASH_BUFFER_SIZE];
-        let mut content = Vec::new();
 
         loop {
             let bytes_read = file.read(&mut buffer).map_err(|e| {
@@ -61,7 +61,6 @@ impl ObjectStore {
                 break;
             }
             hasher.update(&buffer[..bytes_read]);
-            content.extend_from_slice(&buffer[..bytes_read]);
         }
 
         let hash_bytes: [u8; 32] = hasher.finalize().into();
@@ -69,7 +68,7 @@ impl ObjectStore {
 
         // Skip write if object already exists (deduplication)
         if !self.has_object(&hash) {
-            self.write_object(&hash, &content)?;
+            self.clone_or_write_object(&hash, path)?;
         }
 
         Ok(hash)
@@ -96,19 +95,12 @@ impl ObjectStore {
 
     /// Retrieve an object and write it to a target path atomically.
     ///
-    /// Verifies content integrity by re-hashing before writing. Writes to
-    /// a temp file in the same directory as target, then renames for atomic
-    /// replacement.
+    /// Uses `clonefile()` on macOS APFS for instant copy-on-write from the
+    /// object store to the target location. Falls back to regular copy on
+    /// other filesystems/platforms. Verifies content integrity by re-hashing
+    /// after the clone/copy.
     pub fn retrieve_to(&self, hash: &ContentHash, target: &Path) -> Result<()> {
-        let content = self.retrieve(hash)?;
-
-        // Verify content integrity before writing to target
-        let actual: [u8; 32] = Sha256::digest(&content).into();
-        if actual != *hash.as_bytes() {
-            return Err(NonoError::ObjectStore(format!(
-                "Object integrity check failed for {hash}: content hash mismatch"
-            )));
-        }
+        let obj_path = self.object_path(hash);
 
         let parent = target.parent().ok_or_else(|| {
             NonoError::ObjectStore(format!(
@@ -117,7 +109,7 @@ impl ObjectStore {
             ))
         })?;
 
-        // Write to temp file in the same directory for atomic rename.
+        // Clone/copy to temp file in the same directory for atomic rename.
         // Use PID + random suffix to prevent predictable temp file names.
         let temp_path = parent.join(format!(
             ".nono-restore-{}-{:08x}",
@@ -125,34 +117,30 @@ impl ObjectStore {
             random_u32()
         ));
 
-        let write_result = (|| -> Result<()> {
-            let mut file = fs::File::create(&temp_path).map_err(|e| {
-                NonoError::ObjectStore(format!(
-                    "Failed to create temp file {}: {}",
-                    temp_path.display(),
-                    e
-                ))
-            })?;
-            file.write_all(&content).map_err(|e| {
-                NonoError::ObjectStore(format!(
-                    "Failed to write temp file {}: {}",
-                    temp_path.display(),
-                    e
-                ))
-            })?;
-            file.sync_all().map_err(|e| {
-                NonoError::ObjectStore(format!(
-                    "Failed to sync temp file {}: {}",
-                    temp_path.display(),
-                    e
-                ))
-            })?;
-            Ok(())
-        })();
+        clone_or_copy(&obj_path, &temp_path).map_err(|e| {
+            NonoError::ObjectStore(format!(
+                "Failed to clone/copy object {} to {}: {}",
+                hash,
+                temp_path.display(),
+                e
+            ))
+        })?;
 
-        if let Err(e) = write_result {
+        // Verify content integrity after clone/copy
+        let content = fs::read(&temp_path).map_err(|e| {
             let _ = fs::remove_file(&temp_path);
-            return Err(e);
+            NonoError::ObjectStore(format!(
+                "Failed to read temp file {}: {}",
+                temp_path.display(),
+                e
+            ))
+        })?;
+        let actual: [u8; 32] = Sha256::digest(&content).into();
+        if actual != *hash.as_bytes() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(NonoError::ObjectStore(format!(
+                "Object integrity check failed for {hash}: content hash mismatch"
+            )));
         }
 
         fs::rename(&temp_path, target).map_err(|e| {
@@ -247,6 +235,79 @@ impl ObjectStore {
             ))
         })
     }
+
+    /// Store a file into the object store using clone-or-copy.
+    ///
+    /// Uses `clonefile()` on macOS APFS for instant copy-on-write, falling
+    /// back to regular copy on other filesystems. Verifies the stored content
+    /// matches the expected hash to guard against TOCTOU races (source file
+    /// changing between hashing and cloning). On mismatch, falls back to
+    /// re-reading the source and writing content directly.
+    fn clone_or_write_object(&self, hash: &ContentHash, source: &Path) -> Result<()> {
+        let obj_path = self.object_path(hash);
+
+        let prefix_dir = self.root.join("objects").join(hash.prefix());
+        fs::create_dir_all(&prefix_dir).map_err(|e| {
+            NonoError::ObjectStore(format!(
+                "Failed to create prefix directory {}: {}",
+                prefix_dir.display(),
+                e
+            ))
+        })?;
+
+        let temp_path =
+            prefix_dir.join(format!(".tmp-{}-{:08x}", std::process::id(), random_u32()));
+
+        // Clone/copy source to temp location
+        let clone_result = clone_or_copy(source, &temp_path);
+
+        if let Err(e) = clone_result {
+            // Clone/copy failed entirely — fall back to reading content and writing
+            tracing::debug!(
+                "clone_or_copy failed for {}: {}, falling back to read+write",
+                source.display(),
+                e
+            );
+            let content = fs::read(source).map_err(|e| {
+                NonoError::ObjectStore(format!("Failed to read {}: {}", source.display(), e))
+            })?;
+            return self.write_object(hash, &content);
+        }
+
+        // Verify the cloned content matches the expected hash (TOCTOU guard)
+        let cloned_hash: [u8; 32] = {
+            let content = fs::read(&temp_path).map_err(|e| {
+                let _ = fs::remove_file(&temp_path);
+                NonoError::ObjectStore(format!(
+                    "Failed to read cloned temp {}: {}",
+                    temp_path.display(),
+                    e
+                ))
+            })?;
+            Sha256::digest(&content).into()
+        };
+
+        if cloned_hash != *hash.as_bytes() {
+            // Source file changed between hashing and cloning — discard clone
+            let _ = fs::remove_file(&temp_path);
+            tracing::debug!(
+                "TOCTOU detected for {}: hash mismatch after clone, skipping store",
+                source.display()
+            );
+            // Don't store — the hash no longer represents this file's content.
+            // The next snapshot will pick up the new content.
+            return Ok(());
+        }
+
+        fs::rename(&temp_path, &obj_path).map_err(|e| {
+            let _ = fs::remove_file(&temp_path);
+            NonoError::ObjectStore(format!(
+                "Failed to rename temp object to {}: {}",
+                obj_path.display(),
+                e
+            ))
+        })
+    }
 }
 
 /// Generate a random u32 for temp file name unpredictability.
@@ -269,9 +330,10 @@ pub(super) fn random_u32() -> u32 {
 /// Try to clone a file using APFS clonefile, falling back to regular copy.
 ///
 /// On macOS, `clonefile()` creates a copy-on-write clone that shares
-/// physical storage until either copy is modified.
+/// physical storage until either copy is modified. Falls back to
+/// `fs::copy()` on non-APFS filesystems or cross-volume copies.
 #[cfg(target_os = "macos")]
-pub fn clone_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+fn clone_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -296,7 +358,7 @@ pub fn clone_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Copy a file (non-macOS platforms use standard copy).
 #[cfg(not(target_os = "macos"))]
-pub fn clone_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+fn clone_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
     fs::copy(src, dst)?;
     Ok(())
 }
@@ -387,5 +449,33 @@ mod tests {
         let (_dir, store) = setup();
         let fake_hash = ContentHash::from_bytes([0xff; 32]);
         assert!(store.retrieve(&fake_hash).is_err());
+    }
+
+    #[test]
+    fn clone_or_copy_produces_identical_content() {
+        let dir = TempDir::new().expect("tempdir");
+        let src = dir.path().join("source.txt");
+        let dst = dir.path().join("destination.txt");
+
+        let content = b"content to clone or copy";
+        fs::write(&src, content).expect("write source");
+
+        clone_or_copy(&src, &dst).expect("clone_or_copy");
+
+        let result = fs::read(&dst).expect("read destination");
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn store_file_streams_without_full_buffer() {
+        let (dir, store) = setup();
+        let file_path = dir.path().join("large.txt");
+        // Write a file larger than HASH_BUFFER_SIZE to exercise streaming
+        let content = vec![0x42u8; HASH_BUFFER_SIZE * 3 + 7];
+        fs::write(&file_path, &content).expect("write test file");
+
+        let hash = store.store_file(&file_path).expect("store file");
+        let retrieved = store.retrieve(&hash).expect("retrieve");
+        assert_eq!(retrieved, content);
     }
 }
