@@ -145,7 +145,7 @@ mod tests {
     fn test_deny_backend() {
         let backend = TestDenyBackend;
         let request = make_request();
-        let decision = backend.request_capability(&request).ok().expect("decision");
+        let decision = backend.request_capability(&request).expect("decision");
         assert!(decision.is_denied());
         assert_eq!(backend.backend_name(), "test-deny");
     }
@@ -154,7 +154,7 @@ mod tests {
     fn test_grant_backend() {
         let backend = TestGrantBackend;
         let request = make_request();
-        let decision = backend.request_capability(&request).ok().expect("decision");
+        let decision = backend.request_capability(&request).expect("decision");
         assert!(decision.is_granted());
         assert_eq!(backend.backend_name(), "test-grant");
     }

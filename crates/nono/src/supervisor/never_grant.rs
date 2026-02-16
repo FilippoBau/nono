@@ -193,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_empty_checker_allows_all() {
-        let checker = NeverGrantChecker::new(&[]).ok().expect("checker creation");
+        let checker = NeverGrantChecker::new(&[]).expect("checker creation");
         assert!(checker.is_empty());
         assert!(!checker.is_blocked(Path::new("/etc/shadow")));
         assert!(!checker.is_blocked(Path::new("/tmp/anything")));
@@ -201,43 +201,40 @@ mod tests {
 
     #[test]
     fn test_exact_path_blocked() {
-        let tmp = TempDir::new().ok().expect("tmpdir");
+        let tmp = TempDir::new().expect("tmpdir");
         let blocked_file = tmp.path().join("shadow");
-        std::fs::write(&blocked_file, "secret").ok().expect("write");
+        std::fs::write(&blocked_file, "secret").expect("write");
 
-        let checker = NeverGrantChecker::new(&[blocked_file.to_string_lossy().to_string()])
-            .ok()
-            .expect("checker");
+        let checker =
+            NeverGrantChecker::new(&[blocked_file.to_string_lossy().to_string()]).expect("checker");
 
         assert!(checker.is_blocked(&blocked_file));
     }
 
     #[test]
     fn test_subpath_blocked() {
-        let tmp = TempDir::new().ok().expect("tmpdir");
+        let tmp = TempDir::new().expect("tmpdir");
         let blocked_dir = tmp.path().join("secure");
-        std::fs::create_dir(&blocked_dir).ok().expect("mkdir");
+        std::fs::create_dir(&blocked_dir).expect("mkdir");
         let child_file = blocked_dir.join("secret.txt");
-        std::fs::write(&child_file, "secret").ok().expect("write");
+        std::fs::write(&child_file, "secret").expect("write");
 
-        let checker = NeverGrantChecker::new(&[blocked_dir.to_string_lossy().to_string()])
-            .ok()
-            .expect("checker");
+        let checker =
+            NeverGrantChecker::new(&[blocked_dir.to_string_lossy().to_string()]).expect("checker");
 
         assert!(checker.is_blocked(&child_file));
     }
 
     #[test]
     fn test_similar_name_not_blocked() {
-        let tmp = TempDir::new().ok().expect("tmpdir");
+        let tmp = TempDir::new().expect("tmpdir");
         let shadow = tmp.path().join("shadow");
         let shadow2 = tmp.path().join("shadow2");
-        std::fs::write(&shadow, "secret").ok().expect("write");
-        std::fs::write(&shadow2, "not secret").ok().expect("write");
+        std::fs::write(&shadow, "secret").expect("write");
+        std::fs::write(&shadow2, "not secret").expect("write");
 
-        let checker = NeverGrantChecker::new(&[shadow.to_string_lossy().to_string()])
-            .ok()
-            .expect("checker");
+        let checker =
+            NeverGrantChecker::new(&[shadow.to_string_lossy().to_string()]).expect("checker");
 
         assert!(checker.is_blocked(&shadow));
         // shadow2 is NOT blocked - component-wise matching prevents this
@@ -246,13 +243,12 @@ mod tests {
 
     #[test]
     fn test_check_returns_matched_rule() {
-        let tmp = TempDir::new().ok().expect("tmpdir");
+        let tmp = TempDir::new().expect("tmpdir");
         let blocked = tmp.path().join("blocked");
-        std::fs::create_dir(&blocked).ok().expect("mkdir");
+        std::fs::create_dir(&blocked).expect("mkdir");
 
-        let checker = NeverGrantChecker::new(&[blocked.to_string_lossy().to_string()])
-            .ok()
-            .expect("checker");
+        let checker =
+            NeverGrantChecker::new(&[blocked.to_string_lossy().to_string()]).expect("checker");
 
         let result = checker.check(&blocked.join("subfile"));
         assert!(result.is_blocked());
@@ -268,9 +264,8 @@ mod tests {
     #[test]
     fn test_nonexistent_path_still_checked() {
         // Paths that don't exist yet should still be checked
-        let checker = NeverGrantChecker::new(&["/nonexistent/secure".to_string()])
-            .ok()
-            .expect("checker");
+        let checker =
+            NeverGrantChecker::new(&["/nonexistent/secure".to_string()]).expect("checker");
 
         assert!(checker.is_blocked(Path::new("/nonexistent/secure/file.txt")));
         assert!(!checker.is_blocked(Path::new("/nonexistent/other")));
@@ -282,9 +277,8 @@ mod tests {
             return; // Skip if HOME not set
         }
 
-        let checker = NeverGrantChecker::new(&["~/.ssh/authorized_keys".to_string()])
-            .ok()
-            .expect("checker");
+        let checker =
+            NeverGrantChecker::new(&["~/.ssh/authorized_keys".to_string()]).expect("checker");
 
         let home = dirs_home().expect("home");
         assert!(checker.is_blocked(&home.join(".ssh/authorized_keys")));
@@ -294,12 +288,11 @@ mod tests {
 
     #[test]
     fn test_len_and_is_empty() {
-        let checker = NeverGrantChecker::new(&[]).ok().expect("checker");
+        let checker = NeverGrantChecker::new(&[]).expect("checker");
         assert_eq!(checker.len(), 0);
         assert!(checker.is_empty());
 
         let checker = NeverGrantChecker::new(&["/etc/shadow".to_string(), "/boot".to_string()])
-            .ok()
             .expect("checker");
         assert_eq!(checker.len(), 2);
         assert!(!checker.is_empty());

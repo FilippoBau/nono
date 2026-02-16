@@ -108,10 +108,6 @@ pub enum NonoError {
         source: std::io::Error,
     },
 
-    // Signature verification errors
-    #[error("Invalid signature: {reason}")]
-    SignatureInvalid { reason: String },
-
     // Version tracking errors
     #[error("Version downgrade detected for {config}: {current} -> {attempted}")]
     VersionDowngrade {

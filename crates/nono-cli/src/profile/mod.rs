@@ -23,9 +23,6 @@ pub struct ProfileMeta {
     pub description: Option<String>,
     #[serde(default)]
     pub author: Option<String>,
-    ///  signature support
-    #[serde(default)]
-    pub signature: Option<String>,
 }
 
 /// Filesystem configuration in a profile
@@ -224,15 +221,57 @@ fn load_from_file(path: &Path) -> Result<Profile> {
 
 /// Get the path to a user profile
 fn get_user_profile_path(name: &str) -> Result<PathBuf> {
-    let config_dir = match std::env::var("XDG_CONFIG_HOME") {
-        Ok(dir) => PathBuf::from(dir),
-        Err(_) => home_dir()?.join(".config"),
-    };
+    let config_dir = resolve_user_config_dir()?;
 
     Ok(config_dir
         .join("nono")
         .join("profiles")
         .join(format!("{}.json", name)))
+}
+
+/// Resolve the user config directory with secure validation.
+///
+/// Security behavior:
+/// - If `XDG_CONFIG_HOME` is set, it must be absolute.
+/// - If absolute, we canonicalize it to avoid path confusion through symlinks.
+/// - If invalid (relative or cannot be canonicalized), we fall back to `$HOME/.config`.
+fn resolve_user_config_dir() -> Result<PathBuf> {
+    if let Ok(raw) = std::env::var("XDG_CONFIG_HOME") {
+        let path = PathBuf::from(&raw);
+        if path.is_absolute() {
+            match path.canonicalize() {
+                Ok(canonical) => return Ok(canonical),
+                Err(e) => {
+                    tracing::warn!(
+                        "Ignoring invalid XDG_CONFIG_HOME='{}' (canonicalize failed: {}), falling back to $HOME/.config",
+                        raw,
+                        e
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Ignoring invalid XDG_CONFIG_HOME='{}' (must be absolute), falling back to $HOME/.config",
+                raw
+            );
+        }
+    }
+
+    // Fallback: use HOME/.config. Canonicalize HOME when possible, but do not
+    // fail hard if HOME currently points to a non-existent path.
+    let home = home_dir()?;
+    let home_base = match home.canonicalize() {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to canonicalize HOME='{}' ({}), using raw HOME path for fallback",
+                home.display(),
+                e
+            );
+            home
+        }
+    };
+    Ok(home_base.join(".config"))
 }
 
 /// Get home directory path using xdg-home
@@ -336,6 +375,7 @@ pub fn list_profiles() -> Vec<String> {
 mod tests {
     use super::*;
     use std::env;
+    use tempfile::tempdir;
 
     #[test]
     fn test_valid_profile_names() {
@@ -359,6 +399,29 @@ mod tests {
 
         let expanded = expand_vars("$HOME/.config", &workdir).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.config"));
+    }
+
+    #[test]
+    fn test_resolve_user_config_dir_uses_valid_absolute_xdg() {
+        let tmp = tempdir().expect("tmpdir");
+        env::set_var("XDG_CONFIG_HOME", tmp.path());
+        let resolved = resolve_user_config_dir().expect("resolve user config dir");
+        assert_eq!(
+            resolved,
+            tmp.path().canonicalize().expect("canonicalize tmp")
+        );
+        env::remove_var("XDG_CONFIG_HOME");
+    }
+
+    #[test]
+    fn test_resolve_user_config_dir_falls_back_on_relative_xdg() {
+        let expected_home = home_dir().expect("home dir");
+        env::set_var("XDG_CONFIG_HOME", "relative/path");
+
+        let resolved = resolve_user_config_dir().expect("resolve with fallback");
+        assert_eq!(resolved, expected_home.join(".config"));
+
+        env::remove_var("XDG_CONFIG_HOME");
     }
 
     #[test]

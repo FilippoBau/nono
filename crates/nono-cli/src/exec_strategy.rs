@@ -10,6 +10,10 @@
 //! until `exec()`. This module carefully prepares all data in the parent (where
 //! allocation is safe) and uses only raw libc calls in the child.
 
+mod env_sanitization;
+#[cfg(target_os = "linux")]
+mod supervisor_linux;
+
 use nix::libc;
 use nix::sys::signal::{self, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
@@ -32,6 +36,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+pub(crate) use env_sanitization::is_dangerous_env_var;
+use env_sanitization::should_skip_env_var;
+
 /// Resolve a program name to its absolute path.
 ///
 /// This should be called BEFORE the sandbox is applied to ensure the program
@@ -51,46 +58,6 @@ pub fn resolve_program(program: &str) -> Result<PathBuf> {
 /// Maximum threads allowed when keyring backend is active.
 /// Main thread (1) + up to 3 keyring threads for D-Bus/Security.framework.
 const MAX_KEYRING_THREADS: usize = 4;
-
-/// Returns true if an environment variable is unsafe to inherit into a sandboxed child.
-///
-/// Covers linker injection (LD_PRELOAD, DYLD_INSERT_LIBRARIES), shell startup
-/// injection (BASH_ENV, PROMPT_COMMAND, IFS), and interpreter code/module injection
-/// (NODE_OPTIONS, PYTHONPATH, PERL5OPT, RUBYOPT, JAVA_TOOL_OPTIONS, etc.).
-pub(crate) fn is_dangerous_env_var(key: &str) -> bool {
-    // Linker injection
-    key.starts_with("LD_")
-        || key.starts_with("DYLD_")
-        // Shell injection
-        || key == "BASH_ENV"
-        || key == "ENV"
-        || key == "CDPATH"
-        || key == "GLOBIGNORE"
-        || key.starts_with("BASH_FUNC_")
-        || key == "PROMPT_COMMAND"
-        || key == "IFS"
-        // Python injection
-        || key == "PYTHONSTARTUP"
-        || key == "PYTHONPATH"
-        // Node.js injection
-        || key == "NODE_OPTIONS"
-        || key == "NODE_PATH"
-        // Perl injection
-        || key == "PERL5OPT"
-        || key == "PERL5LIB"
-        // Ruby injection
-        || key == "RUBYOPT"
-        || key == "RUBYLIB"
-        || key == "GEM_PATH"
-        || key == "GEM_HOME"
-        // JVM injection
-        || key == "JAVA_TOOL_OPTIONS"
-        || key == "_JAVA_OPTIONS"
-        // .NET injection
-        || key == "DOTNET_STARTUP_HOOKS"
-        // Go injection
-        || key == "GOFLAGS"
-}
 
 /// Threading context for fork safety validation.
 ///
@@ -198,7 +165,7 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
     cmd.env_clear();
 
     for (key, value) in std::env::vars() {
-        if !is_dangerous_env_var(&key) {
+        if !should_skip_env_var(&key, &config.env_vars, &["NONO_CAP_FILE"]) {
             cmd.env(&key, &value);
         }
     }
@@ -296,9 +263,7 @@ pub fn execute_monitor(config: &ExecConfig<'_>) -> Result<i32> {
     // Copy current environment, filtering dangerous and overridden vars
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = config.env_vars.iter().any(|(ek, _)| *ek == k)
-                || k == "NONO_CAP_FILE"
-                || is_dangerous_env_var(k);
+            let should_skip = should_skip_env_var(k, &config.env_vars, &["NONO_CAP_FILE"]);
             if !should_skip {
                 if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
                     env_c.push(cstr);
@@ -569,10 +534,11 @@ pub fn execute_supervised(
     // Copy current environment, filtering dangerous and overridden vars
     for (key, value) in std::env::vars_os() {
         if let (Some(k), Some(v)) = (key.to_str(), value.to_str()) {
-            let should_skip = config.env_vars.iter().any(|(ek, _)| *ek == k)
-                || k == "NONO_CAP_FILE"
-                || k == "NONO_SUPERVISOR_FD"
-                || is_dangerous_env_var(k);
+            let should_skip = should_skip_env_var(
+                k,
+                &config.env_vars,
+                &["NONO_CAP_FILE", "NONO_SUPERVISOR_FD"],
+            );
             if !should_skip {
                 if let Ok(cstr) = CString::new(format!("{}={}", k, v)) {
                     env_c.push(cstr);
@@ -851,14 +817,16 @@ pub fn execute_supervised(
             // named sockets (bind/connect), not socketpair+fork.
 
             // Build initial-set path lookup for seccomp fast-path (Linux)
+            // Stores (resolved_path, is_file) to distinguish file vs directory semantics:
+            // - File capabilities: exact match only (no subpath access)
+            // - Directory capabilities: subpath access allowed via starts_with
             #[cfg(target_os = "linux")]
-            let initial_paths: std::collections::HashSet<std::path::PathBuf> = {
-                let mut set = std::collections::HashSet::new();
-                for cap in config.caps.fs_capabilities() {
-                    set.insert(cap.resolved.clone());
-                }
-                set
-            };
+            let initial_caps: Vec<(std::path::PathBuf, bool)> = config
+                .caps
+                .fs_capabilities()
+                .iter()
+                .map(|cap| (cap.resolved.clone(), cap.is_file))
+                .collect();
 
             // Run IPC event loop if supervisor is configured, otherwise just wait
             let (status, denials) =
@@ -870,7 +838,7 @@ pub fn execute_supervised(
                             &mut sup_sock,
                             sup_cfg,
                             seccomp_notify_fd.as_ref(),
-                            &initial_paths,
+                            &initial_caps,
                         )?
                     }
                     #[cfg(not(target_os = "linux"))]
@@ -1343,8 +1311,12 @@ fn run_supervisor_loop(
 /// - child process exit via non-blocking `waitpid()`
 ///
 /// Seccomp notifications for paths in the initial capability set are handled
-/// immediately (fast-path via HashSet lookup). Other paths go through the
-/// approval backend.
+/// immediately (fast-path). Other paths go through the approval backend.
+///
+/// The initial_caps parameter contains (path, is_file) tuples:
+/// - For files (is_file=true): only exact path matches are allowed
+/// - For directories (is_file=false): subpath matches via starts_with are allowed
+///
 /// Returns the child's wait status and any denial records collected.
 #[cfg(target_os = "linux")]
 fn run_supervisor_loop(
@@ -1352,11 +1324,11 @@ fn run_supervisor_loop(
     sock: &mut SupervisorSocket,
     config: &SupervisorConfig<'_>,
     seccomp_fd: Option<&OwnedFd>,
-    initial_paths: &std::collections::HashSet<std::path::PathBuf>,
+    initial_caps: &[(std::path::PathBuf, bool)],
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
-    let mut rate_limiter = RateLimiter::new(10, 5);
+    let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
     let mut denials = Vec::new();
     // Track whether the supervisor socket is still alive. After exec,
     // CLOEXEC closes the child's socket end, causing POLLHUP. We stop
@@ -1416,11 +1388,11 @@ fn run_supervisor_loop(
             // Check seccomp notify fd (if present)
             if pfds.len() > 1 && pfds[1].revents & libc::POLLIN != 0 {
                 if let Some(nfd) = notify_raw_fd {
-                    if let Err(e) = handle_seccomp_notification(
+                    if let Err(e) = supervisor_linux::handle_seccomp_notification(
                         nfd,
                         child,
                         config,
-                        initial_paths,
+                        initial_caps,
                         &mut rate_limiter,
                         &mut denials,
                     ) {
@@ -1455,189 +1427,6 @@ fn run_supervisor_loop(
 
     let status = wait_for_child(child)?;
     Ok((status, denials))
-}
-
-/// Handle a seccomp notification on Linux.
-///
-/// Flow:
-/// 1. Receive notification (blocking recv from kernel)
-/// 2. Read path from child's /proc/PID/mem
-/// 3. TOCTOU check: verify notification still valid
-/// 4. Check never_grant -> deny (BEFORE initial-set fast-path)
-/// 5. Fast-path: if path is in initial set, open + inject fd immediately
-/// 6. Rate limit check -> deny if exceeded
-/// 7. Delegate to approval backend
-/// 8. Second TOCTOU check before inject/deny
-/// 9. If approved: open path + inject fd. If denied: deny notification.
-#[cfg(target_os = "linux")]
-fn handle_seccomp_notification(
-    notify_fd: std::os::fd::RawFd,
-    child: Pid,
-    config: &SupervisorConfig<'_>,
-    initial_paths: &std::collections::HashSet<std::path::PathBuf>,
-    rate_limiter: &mut RateLimiter,
-    denials: &mut Vec<DenialRecord>,
-) -> Result<()> {
-    use nono::sandbox::{deny_notif, inject_fd, notif_id_valid, read_notif_path, recv_notif};
-
-    // 1. Receive the notification
-    let notif = recv_notif(notify_fd)?;
-
-    // 2. Read the path from the child's memory (args[1] = pathname for openat)
-    let path = match read_notif_path(notif.pid, notif.data.args[1]) {
-        Ok(p) => p,
-        Err(e) => {
-            debug!("Failed to read path from seccomp notification: {}", e);
-            let _ = deny_notif(notify_fd, notif.id);
-            return Ok(());
-        }
-    };
-
-    // 3. First TOCTOU check: verify notification still valid
-    if !notif_id_valid(notify_fd, notif.id)? {
-        debug!("Seccomp notification expired (first TOCTOU check)");
-        return Ok(());
-    }
-
-    // Determine access mode from open flags (args[2] = flags for openat)
-    let flags = notif.data.args[2] as i32;
-    let access = match flags & libc::O_ACCMODE {
-        libc::O_RDONLY => nono::AccessMode::Read,
-        libc::O_WRONLY => nono::AccessMode::Write,
-        _ => nono::AccessMode::ReadWrite, // O_RDWR
-    };
-
-    let canonicalized = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-
-    // 4. Check never_grant BEFORE initial-set fast-path.
-    // never_grant is a hard security boundary: paths like /etc/shadow must be
-    // denied even if they fall under an allowed directory (/etc). Checking
-    // never_grant first ensures policy enforcement regardless of initial set.
-    let never_grant_check = config.never_grant.check(&canonicalized);
-    if !never_grant_check.is_blocked() {
-        // Also check the original (non-canonicalized) path for symlink aliases
-        let never_grant_original = config.never_grant.check(&path);
-        if never_grant_original.is_blocked() {
-            debug!(
-                "Seccomp: path {} (via {}) blocked by never_grant",
-                canonicalized.display(),
-                path.display()
-            );
-            denials.push(DenialRecord {
-                path: path.clone(),
-                access,
-                reason: DenialReason::PolicyBlocked,
-            });
-            let _ = deny_notif(notify_fd, notif.id);
-            return Ok(());
-        }
-    } else {
-        debug!(
-            "Seccomp: path {} blocked by never_grant",
-            canonicalized.display()
-        );
-        denials.push(DenialRecord {
-            path: canonicalized.clone(),
-            access,
-            reason: DenialReason::PolicyBlocked,
-        });
-        let _ = deny_notif(notify_fd, notif.id);
-        return Ok(());
-    }
-
-    // 5. Fast-path: check if path is in the initial capability set.
-    // The canonical path may match directly or be a subpath of an initial-set entry.
-    // This runs after never_grant to ensure policy-blocked paths are always denied.
-    let in_initial_set = initial_paths.iter().any(|p| canonicalized.starts_with(p));
-
-    if in_initial_set {
-        // Path is in the initial set -- open and inject immediately (no prompt)
-        match open_path_for_access(&canonicalized, &access, config.never_grant) {
-            Ok(file) => {
-                // Second TOCTOU check before inject
-                if notif_id_valid(notify_fd, notif.id)? {
-                    inject_fd(notify_fd, notif.id, file.as_raw_fd())?;
-                }
-            }
-            Err(e) => {
-                debug!("Failed to open initial-set path {}: {}", path.display(), e);
-                let _ = deny_notif(notify_fd, notif.id);
-            }
-        }
-        return Ok(());
-    }
-
-    // 6. Rate limit check
-    if !rate_limiter.try_acquire() {
-        debug!("Rate limited seccomp notification for {}", path.display());
-        denials.push(DenialRecord {
-            path: path.clone(),
-            access,
-            reason: DenialReason::RateLimited,
-        });
-        let _ = deny_notif(notify_fd, notif.id);
-        return Ok(());
-    }
-
-    // 7. Delegate to approval backend
-    let request = nono::supervisor::CapabilityRequest {
-        request_id: format!("seccomp-{}", unique_request_id()),
-        path: path.clone(),
-        access,
-        reason: Some("Sandbox intercepted file operation (seccomp-notify)".to_string()),
-        child_pid: child.as_raw() as u32,
-        session_id: String::new(),
-    };
-
-    let decision = match config.approval_backend.request_capability(&request) {
-        Ok(d) => {
-            if d.is_denied() {
-                denials.push(DenialRecord {
-                    path: path.clone(),
-                    access,
-                    reason: DenialReason::UserDenied,
-                });
-            }
-            d
-        }
-        Err(e) => {
-            warn!("Approval backend error for seccomp notification: {}", e);
-            denials.push(DenialRecord {
-                path: path.clone(),
-                access,
-                reason: DenialReason::BackendError,
-            });
-            let _ = deny_notif(notify_fd, notif.id);
-            return Ok(());
-        }
-    };
-
-    // 8. Second TOCTOU check before acting on the decision
-    if !notif_id_valid(notify_fd, notif.id)? {
-        debug!("Seccomp notification expired (second TOCTOU check)");
-        return Ok(());
-    }
-
-    // 9. Act on the decision
-    if decision.is_granted() {
-        match open_path_for_access(&canonicalized, &access, config.never_grant) {
-            Ok(file) => {
-                inject_fd(notify_fd, notif.id, file.as_raw_fd())?;
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to open approved path {}: {}",
-                    canonicalized.display(),
-                    e
-                );
-                let _ = deny_notif(notify_fd, notif.id);
-            }
-        }
-    } else {
-        let _ = deny_notif(notify_fd, notif.id);
-    }
-
-    Ok(())
 }
 
 /// Handle a single supervisor IPC message.
@@ -1830,59 +1619,6 @@ fn open_path_for_access(
     })
 }
 
-/// Token-bucket rate limiter for supervisor expansion requests.
-///
-/// Prevents a compromised agent from flooding the terminal with approval prompts.
-/// Defaults to 10 requests/second with a burst of 5.
-#[cfg(target_os = "linux")]
-struct RateLimiter {
-    /// Maximum tokens (burst capacity)
-    capacity: u32,
-    /// Current available tokens
-    tokens: u32,
-    /// Tokens added per second
-    rate: u32,
-    /// Last token refill time
-    last_refill: std::time::Instant,
-}
-
-#[cfg(target_os = "linux")]
-impl RateLimiter {
-    fn new(rate: u32, burst: u32) -> Self {
-        Self {
-            capacity: burst,
-            tokens: burst,
-            rate,
-            last_refill: std::time::Instant::now(),
-        }
-    }
-
-    /// Try to consume one token. Returns true if allowed, false if rate limited.
-    fn try_acquire(&mut self) -> bool {
-        let now = std::time::Instant::now();
-        let elapsed = now.duration_since(self.last_refill);
-
-        // Refill tokens based on elapsed time
-        let new_tokens = (elapsed.as_millis() as u64)
-            .saturating_mul(self.rate as u64)
-            .saturating_div(1000);
-        if new_tokens > 0 {
-            self.tokens = self.capacity.min(
-                self.tokens
-                    .saturating_add(u32::try_from(new_tokens).unwrap_or(u32::MAX)),
-            );
-            self.last_refill = now;
-        }
-
-        if self.tokens > 0 {
-            self.tokens -= 1;
-            true
-        } else {
-            false
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1975,33 +1711,5 @@ mod tests {
         assert!(!is_dangerous_env_var("CARGO_HOME"));
         assert!(!is_dangerous_env_var("RUST_LOG"));
         assert!(!is_dangerous_env_var("SSH_AUTH_SOCK"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_rate_limiter_allows_burst() {
-        let mut limiter = RateLimiter::new(10, 5);
-        // Should allow 5 requests (burst capacity)
-        for _ in 0..5 {
-            assert!(limiter.try_acquire());
-        }
-        // 6th should be denied (burst exhausted, no time for refill)
-        assert!(!limiter.try_acquire());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn test_rate_limiter_refills_over_time() {
-        let mut limiter = RateLimiter::new(10, 3);
-        // Exhaust burst
-        for _ in 0..3 {
-            assert!(limiter.try_acquire());
-        }
-        assert!(!limiter.try_acquire());
-
-        // Simulate time passing by adjusting last_refill
-        limiter.last_refill -= std::time::Duration::from_millis(500);
-        // 500ms at 10/s = 5 tokens, capped at capacity=3
-        assert!(limiter.try_acquire());
     }
 }

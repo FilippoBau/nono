@@ -105,7 +105,6 @@ pub(crate) fn map_error(e: &nono::NonoError) -> types::NonoErrorCode {
         nono::NonoError::CapFileValidation { .. } | nono::NonoError::CapFileTooLarge { .. } => {
             NonoErrorCode::ErrInvalidArg
         }
-        nono::NonoError::SignatureInvalid { .. } => NonoErrorCode::ErrConfigParse,
         nono::NonoError::VersionDowngrade { .. } => NonoErrorCode::ErrConfigParse,
         nono::NonoError::Io(_) | nono::NonoError::CommandExecution(_) => NonoErrorCode::ErrIo,
         nono::NonoError::ObjectStore(_)

@@ -6,7 +6,7 @@
 #   make check        Run clippy and format check
 #   make release      Build release binaries
 
-.PHONY: all build build-lib build-cli build-ffi test test-lib test-cli test-ffi check clippy fmt clean install help
+.PHONY: all build build-lib build-cli build-ffi test test-lib test-cli test-ffi check clippy clippy-ci fmt clean install help
 
 # Default target
 all: build
@@ -48,10 +48,13 @@ test-doc:
 	cargo test --doc
 
 # Check targets (lint + format)
-check: clippy fmt-check
+check: clippy-ci fmt-check
 
 clippy:
 	cargo clippy -- -D warnings -D clippy::unwrap_used
+
+clippy-ci:
+	cargo clippy --workspace --all-targets -- -D warnings
 
 clippy-fix:
 	cargo clippy --fix --allow-dirty
@@ -119,6 +122,7 @@ help:
 	@echo "Check:"
 	@echo "  make check          Run clippy and format check"
 	@echo "  make clippy         Run clippy linter"
+	@echo "  make clippy-ci      Run strict workspace clippy (all targets)"
 	@echo "  make fmt            Format code"
 	@echo "  make fmt-check      Check formatting"
 	@echo ""

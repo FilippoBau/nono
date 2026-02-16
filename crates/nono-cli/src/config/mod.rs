@@ -7,7 +7,6 @@
 
 pub mod embedded;
 pub mod user;
-pub mod verify;
 pub mod version;
 
 use crate::policy;

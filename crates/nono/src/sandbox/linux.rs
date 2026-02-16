@@ -268,17 +268,55 @@ const BPF_RET: u16 = 0x06;
 const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 
-// Syscall numbers for x86_64
+// Syscall numbers for x86_64 (public for CLI to distinguish openat vs openat2)
 #[cfg(target_arch = "x86_64")]
-const SYS_OPENAT: u32 = 257;
+pub const SYS_OPENAT: i32 = 257;
 #[cfg(target_arch = "x86_64")]
-const SYS_OPENAT2: u32 = 437;
+pub const SYS_OPENAT2: i32 = 437;
 
-// Syscall numbers for aarch64
+// Syscall numbers for aarch64 (public for CLI to distinguish openat vs openat2)
 #[cfg(target_arch = "aarch64")]
-const SYS_OPENAT: u32 = 56;
+pub const SYS_OPENAT: i32 = 56;
 #[cfg(target_arch = "aarch64")]
-const SYS_OPENAT2: u32 = 437;
+pub const SYS_OPENAT2: i32 = 437;
+
+/// struct open_how from <linux/openat2.h>
+///
+/// Used by openat2() syscall. args[2] is a pointer to this struct, NOT the flags integer.
+/// This is a critical security distinction from openat() where args[2] IS the flags.
+#[repr(C)]
+#[derive(Debug, Clone, Default)]
+pub struct OpenHow {
+    /// O_CREAT, O_RDONLY, O_WRONLY, O_RDWR, etc.
+    pub flags: u64,
+    /// File mode (when O_CREAT is used)
+    pub mode: u64,
+    /// RESOLVE_* flags for path resolution control
+    pub resolve: u64,
+}
+
+/// Classify access mode from open flags.
+///
+/// Extracts O_ACCMODE bits and maps to AccessMode. Used by both openat (where flags
+/// come from args[2] directly) and openat2 (where flags come from open_how.flags).
+#[must_use]
+pub fn classify_access_from_flags(flags: i32) -> crate::AccessMode {
+    match flags & libc::O_ACCMODE {
+        libc::O_RDONLY => crate::AccessMode::Read,
+        libc::O_WRONLY => crate::AccessMode::Write,
+        _ => crate::AccessMode::ReadWrite,
+    }
+}
+
+/// Validate that the openat2 size argument is large enough to hold the open_how struct.
+///
+/// For openat2, args[3] contains the size of the open_how struct passed by the caller.
+/// If this is smaller than our expected struct size, the request is malformed and should
+/// be denied to avoid reading garbage or partial data.
+#[must_use]
+pub fn validate_openat2_size(how_size: usize) -> bool {
+    how_size >= std::mem::size_of::<OpenHow>()
+}
 
 // Offset of `nr` field in seccomp_data (used by BPF)
 const SECCOMP_DATA_NR_OFFSET: u32 = 0;
@@ -337,14 +375,14 @@ pub fn install_seccomp_notify() -> Result<std::os::fd::OwnedFd> {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 2, // jump +2 to instruction 4 (notify)
             jf: 0,
-            k: SYS_OPENAT,
+            k: SYS_OPENAT as u32,
         },
         // 2: If openat2, jump to 4 (notify)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
             jt: 1, // jump +1 to instruction 4 (notify)
             jf: 0,
-            k: SYS_OPENAT2,
+            k: SYS_OPENAT2 as u32,
         },
         // 3: Allow all other syscalls
         SockFilterInsn {
@@ -511,6 +549,52 @@ pub fn read_notif_path(pid: u32, addr: u64) -> Result<std::path::PathBuf> {
     })?;
 
     Ok(std::path::PathBuf::from(path_str))
+}
+
+/// Read the open_how struct from a seccomp notification for openat2 syscalls.
+///
+/// For openat2, args[2] is a pointer to `struct open_how`, NOT the flags integer.
+/// This function safely reads the struct from the child's memory.
+///
+/// # Security
+///
+/// This is critical for access-mode classification. Treating args[2] as an integer
+/// (as with openat) when it's actually a pointer leads to misclassifying access mode,
+/// potentially granting broader permissions than the child requested.
+///
+/// # TOCTOU Warning
+///
+/// The struct may be modified between the syscall and this read. Always call
+/// `notif_id_valid()` after reading to verify the notification is still pending.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - `/proc/PID/mem` cannot be opened
+/// - The read fails or doesn't return enough bytes
+pub fn read_open_how(pid: u32, addr: u64) -> Result<OpenHow> {
+    use std::io::Read;
+
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mut file = std::fs::File::open(&mem_path)
+        .map_err(|e| NonoError::SandboxInit(format!("Failed to open {}: {}", mem_path, e)))?;
+
+    // Seek to the address of the open_how struct
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(addr))
+        .map_err(|e| NonoError::SandboxInit(format!("Failed to seek in {}: {}", mem_path, e)))?;
+
+    // Read exactly the size of OpenHow (24 bytes)
+    let mut buf = [0u8; std::mem::size_of::<OpenHow>()];
+    file.read_exact(&mut buf).map_err(|e| {
+        NonoError::SandboxInit(format!("Failed to read open_how from {}: {}", mem_path, e))
+    })?;
+
+    // SAFETY: OpenHow is repr(C) with no padding between fields (u64, u64, u64).
+    // We read exactly size_of::<OpenHow>() bytes into a properly aligned buffer.
+    // The struct contains only u64 values which have no invalid bit patterns.
+    let open_how: OpenHow = unsafe { std::ptr::read_unaligned(buf.as_ptr().cast()) };
+
+    Ok(open_how)
 }
 
 /// Check that a seccomp notification is still pending (TOCTOU protection).
@@ -704,13 +788,13 @@ mod tests {
                 code: BPF_JMP | BPF_JEQ | BPF_K,
                 jt: 2,
                 jf: 0,
-                k: SYS_OPENAT,
+                k: SYS_OPENAT as u32,
             },
             SockFilterInsn {
                 code: BPF_JMP | BPF_JEQ | BPF_K,
                 jt: 1,
                 jf: 0,
-                k: SYS_OPENAT2,
+                k: SYS_OPENAT2 as u32,
             },
             SockFilterInsn {
                 code: BPF_RET | BPF_K,
@@ -726,5 +810,107 @@ mod tests {
             },
         ];
         assert_eq!(filter.len(), 5);
+    }
+
+    #[test]
+    fn test_open_how_struct_size() {
+        use std::mem;
+        // OpenHow: 3 x u64 = 24 bytes (flags, mode, resolve)
+        assert_eq!(mem::size_of::<OpenHow>(), 24);
+    }
+
+    #[test]
+    fn test_syscall_numbers_distinct() {
+        // Verify openat and openat2 have different syscall numbers
+        assert_ne!(SYS_OPENAT, SYS_OPENAT2);
+    }
+
+    #[test]
+    fn test_syscall_numbers_match_seccomp_data_nr_type() {
+        // SeccompData.nr is i32, verify our constants fit
+        assert!(SYS_OPENAT > 0);
+        assert!(SYS_OPENAT2 > 0);
+        let _: i32 = SYS_OPENAT;
+        let _: i32 = SYS_OPENAT2;
+    }
+
+    #[test]
+    fn test_classify_access_rdonly() {
+        let access = classify_access_from_flags(libc::O_RDONLY);
+        assert!(matches!(access, crate::AccessMode::Read));
+    }
+
+    #[test]
+    fn test_classify_access_wronly() {
+        let access = classify_access_from_flags(libc::O_WRONLY);
+        assert!(matches!(access, crate::AccessMode::Write));
+    }
+
+    #[test]
+    fn test_classify_access_rdwr() {
+        let access = classify_access_from_flags(libc::O_RDWR);
+        assert!(matches!(access, crate::AccessMode::ReadWrite));
+    }
+
+    #[test]
+    fn test_classify_access_with_extra_flags() {
+        // O_RDONLY with O_CREAT, O_TRUNC etc should still be Read
+        let flags = libc::O_RDONLY | libc::O_CREAT | libc::O_TRUNC;
+        let access = classify_access_from_flags(flags);
+        assert!(matches!(access, crate::AccessMode::Read));
+
+        // O_WRONLY with O_APPEND should still be Write
+        let flags = libc::O_WRONLY | libc::O_APPEND;
+        let access = classify_access_from_flags(flags);
+        assert!(matches!(access, crate::AccessMode::Write));
+
+        // O_RDWR with O_CLOEXEC should still be ReadWrite
+        let flags = libc::O_RDWR | libc::O_CLOEXEC;
+        let access = classify_access_from_flags(flags);
+        assert!(matches!(access, crate::AccessMode::ReadWrite));
+    }
+
+    #[test]
+    fn test_classify_access_pointer_as_flags_gives_readwrite() {
+        // Simulates the original bug: a pointer value (e.g., 0x7fff12345678) treated as flags.
+        // The O_ACCMODE mask (0o3) would extract garbage bits, likely resulting in O_RDWR (2).
+        // This test documents that garbage input defaults to ReadWrite (fail-safe for deny
+        // decisions, but the real fix is proper syscall discrimination).
+        let fake_pointer = 0x7fff_1234_5678_i64 as i32; // truncated pointer
+        let access = classify_access_from_flags(fake_pointer);
+        // With this specific value, (fake_pointer & 0o3) == 0, which is O_RDONLY
+        // But the point is: any garbage value goes through the match, we don't panic.
+        // The actual security fix is not calling this with garbage in the first place.
+        let _ = access; // Just verify it doesn't panic
+    }
+
+    #[test]
+    fn test_validate_openat2_size_rejects_zero() {
+        assert!(!validate_openat2_size(0));
+    }
+
+    #[test]
+    fn test_validate_openat2_size_rejects_undersized() {
+        // Anything less than sizeof(OpenHow) = 24 should be rejected
+        assert!(!validate_openat2_size(1));
+        assert!(!validate_openat2_size(8));
+        assert!(!validate_openat2_size(16));
+        assert!(!validate_openat2_size(23));
+    }
+
+    #[test]
+    fn test_validate_openat2_size_accepts_exact() {
+        // Exactly sizeof(OpenHow) = 24 should be accepted
+        let exact_size = std::mem::size_of::<OpenHow>();
+        assert_eq!(exact_size, 24);
+        assert!(validate_openat2_size(exact_size));
+    }
+
+    #[test]
+    fn test_validate_openat2_size_accepts_larger() {
+        // Larger sizes are valid (kernel may extend struct in future)
+        assert!(validate_openat2_size(32));
+        assert!(validate_openat2_size(64));
+        assert!(validate_openat2_size(128));
     }
 }

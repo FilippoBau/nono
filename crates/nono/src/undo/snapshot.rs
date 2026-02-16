@@ -907,8 +907,6 @@ mod tests {
             snapshot_count: 2,
             exit_code: Some(0),
             merkle_roots: vec![baseline.merkle_root],
-            signature: None,
-            signing_key_id: None,
         };
 
         manager.save_session_metadata(&meta).expect("save metadata");
@@ -963,8 +961,6 @@ mod tests {
             snapshot_count: 1,
             exit_code: None,
             merkle_roots: vec![baseline.merkle_root],
-            signature: None,
-            signing_key_id: None,
         };
         manager.save_session_metadata(&meta).expect("save");
 

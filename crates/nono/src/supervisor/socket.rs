@@ -422,9 +422,8 @@ mod tests {
 
     #[test]
     fn test_socket_pair_roundtrip() {
-        let (mut supervisor, mut child) = SupervisorSocket::pair()
-            .ok()
-            .expect("Failed to create socket pair");
+        let (mut supervisor, mut child) =
+            SupervisorSocket::pair().expect("Failed to create socket pair");
 
         let request = CapabilityRequest {
             request_id: "req-001".to_string(),
@@ -438,13 +437,11 @@ mod tests {
         // Child sends request
         child
             .send_message(&SupervisorMessage::Request(request.clone()))
-            .ok()
             .expect("Failed to send message");
 
         // Supervisor receives it
         let msg = supervisor
             .recv_message()
-            .ok()
             .expect("Failed to receive message");
         match msg {
             SupervisorMessage::Request(req) => {
@@ -461,14 +458,10 @@ mod tests {
         };
         supervisor
             .send_response(&response)
-            .ok()
             .expect("Failed to send response");
 
         // Child receives it
-        let resp = child
-            .recv_response()
-            .ok()
-            .expect("Failed to receive response");
+        let resp = child.recv_response().expect("Failed to receive response");
         match resp {
             SupervisorResponse::Decision {
                 request_id,
@@ -482,29 +475,24 @@ mod tests {
 
     #[test]
     fn test_fd_passing() {
-        let (supervisor, child) = SupervisorSocket::pair()
-            .ok()
-            .expect("Failed to create socket pair");
+        let (supervisor, child) = SupervisorSocket::pair().expect("Failed to create socket pair");
 
         // Create a temporary file to pass
-        let tmp = tempfile::NamedTempFile::new()
-            .ok()
-            .expect("Failed to create temp file");
+        let tmp = tempfile::NamedTempFile::new().expect("Failed to create temp file");
         let fd = tmp.as_raw_fd();
 
         // Supervisor sends fd
-        supervisor.send_fd(fd).ok().expect("Failed to send fd");
+        supervisor.send_fd(fd).expect("Failed to send fd");
 
         // Child receives fd
-        let received_fd = child.recv_fd().ok().expect("Failed to receive fd");
+        let received_fd = child.recv_fd().expect("Failed to receive fd");
         assert!(received_fd.as_raw_fd() >= 0);
     }
 
     #[test]
     fn test_message_too_large() {
-        let (mut supervisor, _child) = SupervisorSocket::pair()
-            .ok()
-            .expect("Failed to create socket pair");
+        let (mut supervisor, _child) =
+            SupervisorSocket::pair().expect("Failed to create socket pair");
 
         let large_payload = vec![0u8; (MAX_MESSAGE_SIZE as usize) + 1];
         let result = supervisor.write_frame(&large_payload);
@@ -513,12 +501,10 @@ mod tests {
 
     #[test]
     fn test_peer_pid() {
-        let (supervisor, _child) = SupervisorSocket::pair()
-            .ok()
-            .expect("Failed to create socket pair");
+        let (supervisor, _child) = SupervisorSocket::pair().expect("Failed to create socket pair");
 
         // For a socketpair in the same process, peer_pid should return our own PID
-        let pid = supervisor.peer_pid().ok().expect("Failed to get peer PID");
+        let pid = supervisor.peer_pid().expect("Failed to get peer PID");
         assert_eq!(pid, std::process::id());
     }
 }

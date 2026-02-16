@@ -374,6 +374,42 @@ struct ExecutionFlags {
     undo_exclude_globs: Vec<String>,
 }
 
+/// Select execution strategy from user/runtime flags.
+///
+/// Threat-model boundary:
+/// - `Supervised` is an explicit user choice that permits an unsandboxed parent.
+/// - `Direct` is used for interactive/direct-exec paths.
+/// - `Monitor` is the default safer parent-sandboxed mode.
+fn select_execution_strategy(flags: &ExecutionFlags) -> exec_strategy::ExecStrategy {
+    if flags.supervised {
+        exec_strategy::ExecStrategy::Supervised
+    } else if flags.interactive || flags.direct_exec {
+        exec_strategy::ExecStrategy::Direct
+    } else {
+        exec_strategy::ExecStrategy::Monitor
+    }
+}
+
+/// Apply sandbox pre-fork for strategies that require both parent+child confinement.
+fn apply_pre_fork_sandbox(
+    strategy: exec_strategy::ExecStrategy,
+    caps: &CapabilitySet,
+    silent: bool,
+) -> Result<()> {
+    if !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
+        output::print_applying_sandbox(silent);
+        Sandbox::apply(caps)?;
+        output::print_sandbox_active(silent);
+    }
+    Ok(())
+}
+
+fn cleanup_capability_state_file(cap_file_path: &std::path::Path) {
+    if cap_file_path.exists() {
+        let _ = std::fs::remove_file(cap_file_path);
+    }
+}
+
 fn execute_sandboxed(
     program: OsString,
     cmd_args: Vec<OsString>,
@@ -422,28 +458,14 @@ fn execute_sandboxed(
     }
 
     // Determine execution strategy.
-    // --supervised takes precedence over profile interactive mode because
-    // the user explicitly requested supervised features (undo snapshots).
-    let strategy = if flags.supervised {
-        exec_strategy::ExecStrategy::Supervised
-    } else if flags.interactive || flags.direct_exec {
-        exec_strategy::ExecStrategy::Direct
-    } else {
-        exec_strategy::ExecStrategy::Monitor
-    };
+    let strategy = select_execution_strategy(&flags);
 
     if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
         output::print_supervised_info(flags.silent);
     }
 
     // Apply sandbox BEFORE fork for Direct and Monitor modes.
-    // Supervised mode applies sandbox in the child AFTER fork so the
-    // parent stays unsandboxed (required for undo snapshots and future IPC).
-    if !matches!(strategy, exec_strategy::ExecStrategy::Supervised) {
-        output::print_applying_sandbox(flags.silent);
-        Sandbox::apply(caps)?;
-        output::print_sandbox_active(flags.silent);
-    }
+    apply_pre_fork_sandbox(strategy, caps, flags.silent)?;
 
     // Build environment variables for the command
     let env_vars: Vec<(&str, &str)> = loaded_secrets
@@ -482,10 +504,7 @@ fn execute_sandboxed(
         }
         exec_strategy::ExecStrategy::Monitor => {
             let exit_code = exec_strategy::execute_monitor(&config)?;
-            // Clean up capability state file after child exits
-            if cap_file_path.exists() {
-                let _ = std::fs::remove_file(&cap_file_path);
-            }
+            cleanup_capability_state_file(&cap_file_path);
             // Explicitly drop borrows then secrets so Zeroizing destructors
             // run before std::process::exit() which skips destructors.
             drop(config);
@@ -611,8 +630,6 @@ fn execute_sandboxed(
                     snapshot_count: manager.snapshot_count(),
                     exit_code: Some(exit_code),
                     merkle_roots,
-                    signature: None,
-                    signing_key_id: None,
                 };
                 manager.save_session_metadata(&meta)?;
 
@@ -628,10 +645,7 @@ fn execute_sandboxed(
                 let _ = manager.cleanup_new_atomic_temp_files(&atomic_temp_before);
             }
 
-            // Clean up capability state file after child exits
-            if cap_file_path.exists() {
-                let _ = std::fs::remove_file(&cap_file_path);
-            }
+            cleanup_capability_state_file(&cap_file_path);
             drop(config);
             drop(loaded_secrets);
             std::process::exit(exit_code);

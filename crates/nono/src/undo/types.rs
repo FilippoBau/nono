@@ -188,10 +188,6 @@ pub struct SessionMetadata {
     pub exit_code: Option<i32>,
     /// Merkle roots from each snapshot (chain of state commitments)
     pub merkle_roots: Vec<ContentHash>,
-    /// Optional cryptographic signature of the session (for hardware key signing)
-    pub signature: Option<String>,
-    /// Identifier of the signing key used
-    pub signing_key_id: Option<String>,
 }
 
 /// A snapshot manifest capturing filesystem state at a point in time
