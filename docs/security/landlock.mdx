@@ -186,6 +186,13 @@ Note: DNS resolution (UDP) is not blocked by Landlock, only TCP connections.
 
 Landlock follows bind mounts. If `/home` is bind-mounted to `/mnt/home`, access to one affects the other. This is usually not a concern but can be surprising in complex mount configurations.
 
+### No Deny-Within-Allow Semantics
+
+Landlock is allow-list only. It cannot enforce "deny a child path under an allowed parent."  
+Example: allowing `/tmp` while denying `/tmp/.credentials` is not enforceable by Landlock.
+
+nono treats this as a configuration error on Linux and refuses to start when such overlap is detected, rather than running with a silently ineffective deny rule.
+
 ### Special Filesystems
 
 Landlock may behave differently with special filesystems (procfs, sysfs, etc.). nono does not grant access to these by default.

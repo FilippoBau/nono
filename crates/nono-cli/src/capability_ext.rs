@@ -122,8 +122,8 @@ impl CapabilitySetExt for CapabilitySet {
             caps.add_blocked_command(cmd.clone());
         }
 
-        // Validate deny/allow overlaps (warns on Linux where Landlock can't enforce denies)
-        policy::validate_deny_overlaps(&resolved.deny_paths, &caps);
+        // Validate deny/allow overlaps (hard-fail on Linux where Landlock cannot enforce denies)
+        policy::validate_deny_overlaps(&resolved.deny_paths, &caps)?;
 
         // Keep broad keychain deny groups active, but allow explicit
         // login.keychain-db read grants (profile/CLI) on macOS.
@@ -230,8 +230,8 @@ impl CapabilitySetExt for CapabilitySet {
         // Apply CLI overrides (CLI args take precedence)
         add_cli_overrides(&mut caps, args)?;
 
-        // Validate deny/allow overlaps (warns on Linux where Landlock can't enforce denies)
-        policy::validate_deny_overlaps(&resolved.deny_paths, &caps);
+        // Validate deny/allow overlaps (hard-fail on Linux where Landlock cannot enforce denies)
+        policy::validate_deny_overlaps(&resolved.deny_paths, &caps)?;
 
         // Keep broad keychain deny groups active, but allow explicit
         // login.keychain-db read grants (profile/CLI) on macOS.

@@ -551,19 +551,31 @@ pub fn apply_unlink_overrides(caps: &mut CapabilitySet) {
     }
 }
 
+/// Resolve deny.access paths for a group list without mutating caller capabilities.
+pub fn resolve_deny_paths_for_groups(
+    policy: &Policy,
+    group_names: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut tmp_caps = CapabilitySet::new();
+    let resolved = resolve_groups(policy, group_names, &mut tmp_caps)?;
+    Ok(resolved.deny_paths)
+}
+
 /// Check for deny paths that overlap with allowed paths on Linux.
 ///
-/// Landlock is strictly allow-list — it cannot deny a child of an allowed parent.
-/// This function warns about `deny.access` paths that fall under broader allows,
-/// since those denials have no enforcement on Linux.
+/// Landlock is strictly allow-list and cannot deny a child of an allowed parent.
+/// On Linux, overlap between `deny.access` and allowed parent paths is a hard error
+/// because the deny rule would silently have no effect.
 ///
 /// On macOS this is a no-op (Seatbelt handles deny-within-allow natively).
 ///
-/// **Must be called after all paths are finalized** (groups + profile + CLI overrides).
-pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) {
+/// **Must be called after all paths are finalized** (groups + profile + CLI overrides + CWD).
+pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) -> Result<()> {
     if cfg!(target_os = "macos") {
-        return;
+        return Ok(());
     }
+
+    let mut conflicts = Vec::new();
 
     for deny_path in deny_paths {
         for cap in caps.fs_capabilities() {
@@ -572,16 +584,48 @@ pub fn validate_deny_overlaps(deny_paths: &[PathBuf], caps: &CapabilitySet) {
             }
             // Check if deny path is a child of an allowed directory
             if deny_path.starts_with(&cap.resolved) && *deny_path != cap.resolved {
-                warn!(
-                    "Landlock cannot enforce deny for '{}': parent '{}' is allowed \
-                     (source: {}). This deny has no effect on Linux.",
+                let conflict = format!(
+                    "deny '{}' overlaps allowed parent '{}' (source: {})",
                     deny_path.display(),
                     cap.resolved.display(),
                     cap.source,
                 );
+                warn!(
+                    "Landlock cannot enforce {}. This deny has no effect on Linux.",
+                    conflict
+                );
+                conflicts.push(conflict);
             }
         }
     }
+
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    conflicts.sort();
+    conflicts.dedup();
+
+    let preview = conflicts
+        .iter()
+        .take(5)
+        .map(|c| format!("- {}", c))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let remainder = conflicts.len().saturating_sub(5);
+    let more = if remainder > 0 {
+        format!("\n- ... and {} more conflict(s)", remainder)
+    } else {
+        String::new()
+    };
+
+    Err(NonoError::SandboxInit(format!(
+        "Landlock deny-overlap is not enforceable on Linux. Refusing to start with conflicting policy.\n\
+         Remove the broad allow path, remove the deny path, or restructure permissions.\n\
+         Conflicts:\n{}{}",
+        preview, more
+    )))
 }
 
 /// Get the list of all group names defined in the policy
@@ -1020,8 +1064,17 @@ mod tests {
             );
         }
 
-        // Always safe to call (no-op on macOS)
-        validate_deny_overlaps(&deny_paths, &caps);
+        // macOS: no-op, Linux: hard error
+        if cfg!(target_os = "linux") {
+            let err = validate_deny_overlaps(&deny_paths, &caps)
+                .expect_err("Expected overlap to fail on Linux");
+            assert!(
+                err.to_string().contains("Landlock deny-overlap"),
+                "Expected deny-overlap error message, got: {err}"
+            );
+        } else {
+            validate_deny_overlaps(&deny_paths, &caps).expect("no-op on macOS");
+        }
     }
 
     #[test]
@@ -1048,7 +1101,7 @@ mod tests {
             "Should not detect overlap for unrelated paths"
         );
 
-        validate_deny_overlaps(&deny_paths, &caps);
+        validate_deny_overlaps(&deny_paths, &caps).expect("No overlap should succeed");
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! - The child process is sandboxed but untrusted.
 //! - All seccomp notifications must be fail-closed on parse/validation errors.
 //! - Path opens performed by the supervisor must re-validate policy boundaries.
+//! - Security boundary: the supervisor's `open_path_for_access()` + `inject_fd()`
+//!   is authoritative. `notif_id_valid()` only proves notification liveness.
 
 use super::*;
 
@@ -71,6 +73,11 @@ impl RateLimiter {
 /// 8. Second TOCTOU check before inject/deny
 /// 9. If approved: open path + inject fd. If denied: deny notification.
 ///
+/// TOCTOU boundary note:
+/// - The child controls userspace pointers until syscall completion.
+/// - We treat notification ID validation as a liveness guard only.
+/// - Authorization is bound to the file descriptor opened by the supervisor.
+///
 /// The initial_caps parameter contains (path, is_file) tuples:
 /// - For files (is_file=true): only exact path matches are allowed
 /// - For directories (is_file=false): subpath matches via starts_with are allowed
@@ -119,7 +126,7 @@ pub(super) fn handle_seccomp_notification(
             let how_size = notif.data.args[3] as usize;
             if !validate_openat2_size(how_size) {
                 debug!(
-                    "openat2 size {} < minimum, denying malformed request",
+                    "openat2 size {} outside accepted range, denying malformed request",
                     how_size
                 );
                 let _ = deny_notif(notify_fd, notif.id);

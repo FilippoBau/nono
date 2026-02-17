@@ -313,9 +313,16 @@ pub fn classify_access_from_flags(flags: i32) -> crate::AccessMode {
 /// For openat2, args[3] contains the size of the open_how struct passed by the caller.
 /// If this is smaller than our expected struct size, the request is malformed and should
 /// be denied to avoid reading garbage or partial data.
+///
+/// We also reject unreasonably large sizes. The supervisor only reads the stable
+/// leading fields we know (`flags`, `mode`, `resolve`) and should be recompiled
+/// against newer kernel headers when `struct open_how` evolves.
+const OPENAT2_HOW_SIZE_MAX: usize = 4096;
+
 #[must_use]
 pub fn validate_openat2_size(how_size: usize) -> bool {
-    how_size >= std::mem::size_of::<OpenHow>()
+    let min_size = std::mem::size_of::<OpenHow>();
+    how_size >= min_size && how_size <= OPENAT2_HOW_SIZE_MAX
 }
 
 // Offset of `nr` field in seccomp_data (used by BPF)
@@ -512,6 +519,10 @@ pub fn recv_notif(notify_fd: std::os::fd::RawFd) -> Result<SeccompNotif> {
 /// The path read here may have been modified between the syscall and this read.
 /// Always call `notif_id_valid()` after reading to verify the notification is
 /// still pending (the child hasn't been killed and its PID recycled).
+///
+/// Security boundary note: notification ID validation is only a liveness check.
+/// Authorization is bound to the path opened by the supervisor itself; the child
+/// receives that already-opened fd via `inject_fd()`.
 ///
 /// # Errors
 ///
@@ -908,9 +919,15 @@ mod tests {
 
     #[test]
     fn test_validate_openat2_size_accepts_larger() {
-        // Larger sizes are valid (kernel may extend struct in future)
+        // Larger (but bounded) sizes are valid (kernel may extend struct in future)
         assert!(validate_openat2_size(32));
         assert!(validate_openat2_size(64));
         assert!(validate_openat2_size(128));
+    }
+
+    #[test]
+    fn test_validate_openat2_size_rejects_unreasonably_large() {
+        assert!(!validate_openat2_size(4097));
+        assert!(!validate_openat2_size(usize::MAX));
     }
 }

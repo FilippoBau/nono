@@ -171,6 +171,12 @@ Profiles support these environment variables in path values:
 | `$TMPDIR` | System temporary directory |
 | `$UID` | Current user ID |
 
+## macOS Keychain Exception
+
+On macOS, explicitly granting `login.keychain-db` in a profile (for example via `filesystem.read_file`) enables a keychain compatibility exception in the generated Seatbelt profile. nono skips default denies for `com.apple.SecurityServer` and `com.apple.securityd` Mach lookups so keychain-backed auth flows can run.
+
+This is intentional but broader than file-only semantics, because keychain operations are mediated through Mach IPC rather than direct file reads.
+
 ## Creating User Profiles
 
 1. Create the profiles directory:

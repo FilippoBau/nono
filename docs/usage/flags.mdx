@@ -301,6 +301,8 @@ In supervised mode:
 - nono takes a final snapshot when the command exits
 - You're prompted to review changes and optionally restore files
 - The unsandboxed parent can provide better diagnostics on failures
+- On Linux, seccomp-notify capability expansion is authorized by paths opened by the parent supervisor and injected as file descriptors (notification validity checks are liveness checks, not the authorization boundary)
+- Supervised mode requires single-threaded fork safety; `--secrets` is intentionally incompatible in this mode to avoid keyring-thread fork deadlocks
 
 This is required for the undo system and recommended for long-running agent sessions.
 
