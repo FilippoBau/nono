@@ -11,19 +11,14 @@
   <sub>The standard for secure software attestation, used by PyPI, npm, brew, and Maven Central</sub>
 </p>
 <p>
-  <a href="https://opensource.org/licenses/Apache-2.0">
-    <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"/>
+  <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"/></a>
+  <a href="https://github.com/always-further/nono/actions/workflows/ci.yml"><img src="https://github.com/always-further/nono/actions/workflows/ci.yml/badge.svg" alt="CI Status"/></a>
+  <a href="https://docs.nono.sh"><img src="https://img.shields.io/badge/Docs-docs.nono.sh-green.svg" alt="Documentation"/></a>
+</p>
+<p>
+  <a href="https://discord.gg/pPcjYzGvbS">
+    <img src="https://img.shields.io/badge/Chat-Join%20Discord-7289da?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord"/>
   </a>
-  <a href="https://github.com/always-further/nono/actions/workflows/ci.yml">
-    <img src="https://github.com/always-further/nono/actions/workflows/ci.yml/badge.svg" alt="CI Status"/>
-  </a>
-  <a href="https://docs.nono.sh">
-    <img src="https://img.shields.io/badge/Docs-docs.nono.sh-green.svg" alt="Documentation"/>
-  </a>
-</b>
-<a href="https://discord.gg/pPcjYzGvbS">
-  <img src="https://img.shields.io/badge/Chat-Join%20Discord-7289da?style=for-the-badge&logo=discord&logoColor=white" alt="Join Discord"/>
-</a>
 </p>
 
 </div>
