@@ -1,4 +1,28 @@
 {
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "nono CLI",
+  "logo": {
+    "dark": "/assets/logo.png",
+    "light": "/assets/logo.png"
+  },
+  "favicon": "/assets/logo.png",
+  "colors": {
+    "primary": "#6366F1"
+  },
+  "appearance": {
+    "default": "dark"
+  },
+  "navbar": {
+    "links": [
+      { "label": "GitHub", "href": "https://github.com/always-further/nono" }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Discord",
+      "href": "https://discord.gg/pPcjYzGvbS"
+    }
+  },
   "navigation": {
     "groups": [
       {
@@ -44,5 +68,11 @@
         "pages": ["cli/development/index", "cli/development/testing"]
       }
     ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/always-further/nono",
+      "discord": "https://discord.gg/pPcjYzGvbS"
+    }
   }
 }
