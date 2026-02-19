@@ -33,7 +33,7 @@ AI agents get filesystem access, run shell commands, and are inherently open to 
 
 Kernel-enforced sandboxing (Landlock/Seatbelt) blocks unauthorized access at the syscall level. Every filesystem change gets a rollback snapshot with integrity protection. Destructive commands are denied before they run. Secrets are injected without touching disk. When the agent needs access outside its permissions, a kernel-mediated supervisor intercepts the syscall via seccomp BPF, opens the file after user approval, and injects only the file descriptor — the agent never executes its own open(). No root or CAP_SYS_ADMIN required. Runs on any Linux kernel 5.13+ — bare metal, containers, Firecracker, Kata.
 
-> *"If I ever built an AI Agent sandbox, it would be nono"* — Chuck Norris (allegedly)
+> *"nono, so secure, Chuck Norris tried to break out, but gave up and went home."* — Chuck Norris (allegedly)
 
 > 
 ## CLI
