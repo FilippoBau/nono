@@ -330,6 +330,14 @@ Use direct execution mode. nono applies the sandbox and then `exec()`s directly 
 nono run --exec --allow-cwd -- my-command
 ```
 
+#### `--no-diagnostics`
+
+Suppress the diagnostic footer when the command exits non-zero. Useful for scripts that parse stderr and need stable output.
+
+```bash
+nono run --no-diagnostics --allow-cwd -- my-command
+```
+
 ### Operational Flags
 
 #### `--dry-run`
