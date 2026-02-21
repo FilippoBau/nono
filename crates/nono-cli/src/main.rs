@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod exec_strategy;
 mod hooks;
+mod instruction_deny;
 mod learn;
 mod output;
 mod policy;
@@ -20,6 +21,9 @@ mod rollback_ui;
 mod sandbox_state;
 mod setup;
 mod terminal_approval;
+mod trust_cmd;
+mod trust_intercept;
+mod trust_scan;
 
 use capability_ext::CapabilitySetExt;
 use clap::Parser;
@@ -62,6 +66,7 @@ fn run() -> Result<()> {
                 args.rollback,
                 args.supervised,
                 args.no_rollback_prompt,
+                args.trust_override,
                 cli.silent,
             )
         }
@@ -72,6 +77,7 @@ fn run() -> Result<()> {
         Commands::Why(args) => run_why(*args),
         Commands::Setup(args) => run_setup(args),
         Commands::Rollback(args) => rollback_commands::run_rollback(args),
+        Commands::Trust(args) => trust_cmd::run_trust(args),
         Commands::Audit(args) => audit_commands::run_audit(args),
     }
 }
@@ -255,6 +261,7 @@ fn run_sandbox(
     rollback: bool,
     supervised: bool,
     no_rollback_prompt: bool,
+    trust_override: bool,
     silent: bool,
 ) -> Result<()> {
     // Check if we have a command to run
@@ -279,10 +286,58 @@ fn run_sandbox(
         return Ok(());
     }
 
-    #[cfg(not(target_os = "linux"))]
-    let prepared = prepare_sandbox(&args, silent)?;
-    #[cfg(target_os = "linux")]
     let mut prepared = prepare_sandbox(&args, silent)?;
+
+    // Compute scan root for trust policy discovery and instruction file scanning.
+    let scan_root = args
+        .workdir
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    // Pre-exec trust scan: verify instruction files before the agent reads them.
+    // Must run BEFORE sandbox application so we can still read bundles and policy.
+    // The trust_policy and scan_result are preserved for macOS deny rule injection.
+    let scan_result = if trust_override {
+        if !silent {
+            eprintln!(
+                "  {}",
+                "WARNING: --trust-override active, skipping instruction file verification."
+                    .yellow()
+            );
+        }
+        None
+    } else {
+        let trust_policy = trust_scan::load_scan_policy(&scan_root, false)?;
+        let result = trust_scan::run_pre_exec_scan(&scan_root, &trust_policy, silent)?;
+        if !result.results.is_empty() {
+            info!(
+                "Trust scan: {} verified, {} blocked, {} warned ({} total files)",
+                result.verified,
+                result.blocked,
+                result.warned,
+                result.results.len()
+            );
+        }
+        if !result.should_proceed() {
+            return Err(NonoError::TrustVerification {
+                path: String::new(),
+                reason: "instruction files failed trust verification".to_string(),
+            });
+        }
+
+        // Inject instruction file deny rules into the Seatbelt profile (macOS only).
+        // Deny-regex rules block reading any file matching instruction patterns.
+        // Literal allows re-enable reading for files that passed verification.
+        instruction_deny::inject_instruction_deny_rules(
+            &mut prepared.caps,
+            &trust_policy,
+            &result.verified_paths(),
+        )?;
+
+        Some(result)
+    };
+    let _ = &scan_result; // suppress unused warning on non-macOS
 
     // Enable sandbox extensions for transparent capability expansion in supervised mode.
     // On Linux, seccomp-notify intercepts syscalls at the kernel level -- this flag is
@@ -291,6 +346,8 @@ fn run_sandbox(
     if supervised {
         prepared.caps.set_extensions_enabled(true);
     }
+
+    let trust_scan_verified = scan_result.as_ref().is_some_and(|r| r.verified > 0);
 
     execute_sandboxed(
         program,
@@ -304,7 +361,10 @@ fn run_sandbox(
             rollback,
             supervised,
             no_rollback_prompt,
+            trust_override,
             silent,
+            scan_root,
+            trust_scan_verified,
             rollback_exclude_patterns: prepared.rollback_exclude_patterns,
             rollback_exclude_globs: prepared.rollback_exclude_globs,
         },
@@ -359,7 +419,10 @@ fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
             rollback: false,
             supervised: false,
             no_rollback_prompt: false,
+            trust_override: false,
             silent,
+            scan_root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            trust_scan_verified: false,
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
         },
@@ -374,7 +437,12 @@ struct ExecutionFlags {
     rollback: bool,
     supervised: bool,
     no_rollback_prompt: bool,
+    trust_override: bool,
     silent: bool,
+    /// Root directory for trust policy discovery and scanning
+    scan_root: std::path::PathBuf,
+    /// Whether trust scan ran and verified at least one file (crypto threads may linger)
+    trust_scan_verified: bool,
     /// Profile-specific rollback exclusion patterns (additive on base)
     rollback_exclude_patterns: Vec<String>,
     /// Profile-specific rollback exclusion globs (filename matching)
@@ -481,9 +549,14 @@ fn execute_sandboxed(
         .map(|s| (s.env_var.as_str(), s.value.as_str()))
         .collect();
 
-    // Determine threading context for fork safety
+    // Determine threading context for fork safety.
+    // Secret loading uses the keyring backend which may hold allocator locks.
+    // Trust scan crypto verification (aws-lc-rs ECDSA) spawns idle pool workers
+    // parked on condvars — safe even for supervised mode's post-fork allocation.
     let threading = if !loaded_secrets.is_empty() {
         exec_strategy::ThreadingContext::KeyringExpected
+    } else if flags.trust_scan_verified {
+        exec_strategy::ThreadingContext::CryptoExpected
     } else {
         exec_strategy::ThreadingContext::Strict
     };
@@ -641,8 +714,48 @@ fn execute_sandboxed(
                 }
             });
 
+            let trust_interceptor = if !flags.trust_override {
+                match trust_scan::load_scan_policy(&flags.scan_root, false) {
+                    Ok(p) => {
+                        match trust_intercept::TrustInterceptor::new(p, flags.scan_root.clone()) {
+                            Ok(interceptor) => Some(interceptor),
+                            Err(e) => {
+                                tracing::warn!("Trust interceptor pattern compilation failed: {e}");
+                                eprintln!(
+                                    "  {}",
+                                    format!(
+                                        "WARNING: Runtime instruction file verification disabled \
+                                     (pattern error: {e})"
+                                    )
+                                    .yellow()
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Trust policy load failed for interceptor: {e}");
+                        eprintln!(
+                            "  {}",
+                            format!(
+                                "WARNING: Runtime instruction file verification disabled \
+                                 (policy error: {e})"
+                            )
+                            .yellow()
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let started = chrono::Local::now().to_rfc3339();
-            let exit_code = exec_strategy::execute_supervised(&config, supervisor_cfg.as_ref())?;
+            let exit_code = exec_strategy::execute_supervised(
+                &config,
+                supervisor_cfg.as_ref(),
+                trust_interceptor,
+            )?;
             let ended = chrono::Local::now().to_rfc3339();
 
             // Post-exit: take final snapshot and offer restore
